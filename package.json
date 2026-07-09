@@ -1,0 +1,51 @@
+{
+  "name": "@platformatic/memcached",
+  "version": "0.1.0",
+  "description": "Minimal, high-performance memcached client for Node.js based on the meta text protocol",
+  "license": "Apache-2.0",
+  "type": "module",
+  "main": "index.js",
+  "types": "index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "default": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "lib"
+  ],
+  "engines": {
+    "node": ">= 22.12.0"
+  },
+  "scripts": {
+    "lint": "eslint",
+    "lint:fix": "eslint --fix",
+    "pretest": "docker run -d --rm --name plt-memcached-test -p 11211:11211 memcached:alpine > /dev/null 2>&1 || true",
+    "test": "node --test --test-concurrency=1 test/*.test.js test/*.test.cjs",
+    "posttest": "docker rm -f plt-memcached-test > /dev/null 2>&1 || true",
+    "benchmark": "node benchmarks/compare.js"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/platformatic/memcached.git"
+  },
+  "bugs": {
+    "url": "https://github.com/platformatic/memcached/issues"
+  },
+  "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "eslint": "^9.0.0",
+    "memjs": "^1.3.2",
+    "neostandard": "^0.12.0"
+  },
+  "keywords": [
+    "memcached",
+    "cache",
+    "meta protocol",
+    "client"
+  ]
+}
