@@ -15,7 +15,7 @@
 import { randomBytes } from 'node:crypto'
 import { setImmediate as immediate } from 'node:timers/promises'
 import memjs from 'memjs'
-import { Client } from '../index.js'
+import { Client } from '../src/index.ts'
 
 const HANDLERS = 500
 const ITERATIONS = 100_000

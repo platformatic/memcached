@@ -2,7 +2,7 @@ import { deepStrictEqual, strictEqual, match, ok } from 'node:assert'
 import { randomBytes } from 'node:crypto'
 import { before, test } from 'node:test'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { createClient, testKey, waitForServer } from './helper.js'
+import { createClient, testKey, waitForServer } from './helper.ts'
 
 before(() => waitForServer())
 

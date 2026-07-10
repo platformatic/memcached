@@ -4,7 +4,7 @@
 
 import { randomBytes } from 'node:crypto'
 import memjs from 'memjs'
-import { Client } from '../index.js'
+import { Client } from '../src/index.ts'
 
 const ITERATIONS = 50_000
 const CONCURRENCY = 500

@@ -1,8 +1,8 @@
 import { deepStrictEqual, ok, rejects, strictEqual, throws } from 'node:assert'
 import { before, test } from 'node:test'
 import { setImmediate as immediate } from 'node:timers/promises'
-import { Client, ConnectionError, ValidationError } from '../index.js'
-import { createClient, testKey, waitForServer } from './helper.js'
+import { Client, ConnectionError, ValidationError } from '../src/index.ts'
+import { createClient, testKey, waitForServer } from './helper.ts'
 
 before(() => waitForServer())
 
@@ -13,7 +13,9 @@ test('true is an alias for tick mode and invalid values throw', t => {
   const explicit = createClient(t, undefined, { autoPipelining: 'microtask' })
   ok(explicit instanceof Client)
 
+  // @ts-expect-error - invalid on purpose
   throws(() => new Client('localhost:11211', { autoPipelining: 'sometimes' }), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => new Client('localhost:11211', { autoPipelining: 42 }), ValidationError)
 })
 
@@ -25,7 +27,7 @@ test('ordering is preserved under tick mode with interleaved async issuers', asy
 
   // Each issuer is an independent async context: every iteration resumes
   // from await in its own microtask cascade, not one synchronous loop.
-  async function issuer (id) {
+  async function issuer (id: number) {
     const key = `${prefix}:${id}`
 
     for (let i = 0; i < iterations; i++) {
@@ -94,7 +96,7 @@ test('reconnect while corked replays queued commands correctly', async t => {
   // The in-flight command is corked when the socket drops: it must reject,
   // while commands issued after the drop are queued and replayed.
   const inflight = client.get(key)
-  client.connection.socket.destroy()
+  client.connection.socket!.destroy()
 
   const queued = [client.get(key), client.set(key, 'after-drop'), client.get(key)]
 
@@ -120,11 +122,11 @@ test('tick mode coalesces issuers from separate macrotasks into fewer flushes', 
   // macrotask with its own microtask checkpoint, like independent request
   // handlers. Microtask mode flushes once per callback, tick mode coalesces
   // the whole event loop iteration.
-  async function load (client) {
+  async function load (client: Client) {
     const before = { writes: client.connection.writes, flushes: client.connection.flushes }
 
     const commands = new Array(count)
-    await new Promise(resolve => {
+    await new Promise<void>(resolve => {
       let scheduled = 0
 
       for (let i = 0; i < count; i++) {

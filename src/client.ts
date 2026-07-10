@@ -8,9 +8,10 @@ import {
   TYPE_GETS,
   TYPE_NOOP,
   TYPE_SET,
-  TYPE_VERSION
-} from './connection.js'
-import { ValidationError } from './errors.js'
+  TYPE_VERSION,
+  type ClientOptions
+} from './connection.ts'
+import { ValidationError } from './errors.ts'
 
 const DEFAULT_PORT = 11211
 const CRLF = '\r\n'
@@ -19,7 +20,37 @@ const CRLF = '\r\n'
 const KEY_EXPRESSION = /^[\x21-\x7e]{1,250}$/
 const CAS_EXPRESSION = /^\d+$/
 
-function parseAddress (url) {
+export interface ServerAddress {
+  host?: string
+  port?: number
+}
+
+export interface StoreOptions {
+  /**
+   * Expiration time in seconds. 0 (the default) means the item never expires.
+   * Memcached only supports second granularity: round sub-second TTLs up.
+   * Values greater than 30 days are interpreted by the server as absolute
+   * Unix timestamps.
+   */
+  ttl?: number
+}
+
+export interface DeleteOptions {
+  /**
+   * When provided, the item is only deleted if its current CAS token matches.
+   */
+  cas?: string | number | bigint
+}
+
+export interface GetsResult {
+  value: Buffer
+  /**
+   * Opaque CAS token to pass to cas() or delete().
+   */
+  cas: string
+}
+
+function parseAddress (url: string | ServerAddress): { host: string, port: number } {
   if (typeof url === 'object' && url !== null) {
     return { host: url.host ?? 'localhost', port: Number(url.port ?? DEFAULT_PORT) }
   }
@@ -53,7 +84,7 @@ function parseAddress (url) {
   return { host, port: parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORT }
 }
 
-function validateKey (key) {
+function validateKey (key: string): void {
   if (typeof key !== 'string' || !KEY_EXPRESSION.test(key)) {
     throw new ValidationError(
       'Keys must be non-empty strings of at most 250 printable ASCII characters and cannot contain whitespace or control characters'
@@ -61,7 +92,7 @@ function validateKey (key) {
   }
 }
 
-function validateValue (value) {
+function validateValue (value: Buffer | string): Buffer {
   if (Buffer.isBuffer(value)) {
     return value
   }
@@ -73,7 +104,7 @@ function validateValue (value) {
   throw new ValidationError('Values must be buffers or strings')
 }
 
-function validateTTL (ttl) {
+function validateTTL (ttl: number | undefined): number {
   if (ttl === undefined) {
     return 0
   }
@@ -85,7 +116,7 @@ function validateTTL (ttl) {
   return ttl
 }
 
-function validateCas (cas) {
+function validateCas (cas: string | number | bigint): string {
   if (typeof cas === 'number' || typeof cas === 'bigint') {
     cas = cas.toString()
   }
@@ -97,7 +128,7 @@ function validateCas (cas) {
   return cas
 }
 
-function validateDelta (delta) {
+function validateDelta (delta: number | bigint): string {
   if ((typeof delta !== 'number' && typeof delta !== 'bigint') || (typeof delta === 'number' && !Number.isSafeInteger(delta))) {
     throw new ValidationError('The delta must be an integer number or a bigint')
   }
@@ -110,95 +141,139 @@ function validateDelta (delta) {
 }
 
 export class Client {
-  #connection
+  #connection: Connection
   #opaque = 0
 
-  constructor (url = 'localhost:11211', options = {}) {
+  /**
+   * Creates a client connected to a single memcached server.
+   *
+   * @param url `'host:port'`, `'memcached://host:port'` or `{ host, port }`.
+   *            Defaults to `localhost:11211`.
+   */
+  constructor (url: string | ServerAddress = 'localhost:11211', options: ClientOptions = {}) {
     const { host, port } = parseAddress(url)
     this.#connection = new Connection(host, port, options)
   }
 
   // Internal, exposed for tests only
-  get connection () {
+  get connection (): Connection {
     return this.#connection
   }
 
-  get (key) {
+  /**
+   * Returns the value for the key, or `null` on a miss.
+   */
+  get (key: string): Promise<Buffer | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
     return this.#connection.execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque)
   }
 
-  gets (key) {
+  /**
+   * Returns the value and its CAS token, or `null` on a miss.
+   */
+  gets (key: string): Promise<GetsResult | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
     return this.#connection.execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque)
   }
 
-  set (key, value, options) {
+  /**
+   * Unconditionally stores the value. Throws on failure.
+   */
+  set (key: string, value: Buffer | string, options?: StoreOptions): Promise<void> {
     return this.#store(TYPE_SET, '', key, value, options)
   }
 
-  add (key, value, options) {
+  /**
+   * Stores the value only if the key does not exist yet.
+   * Returns `false` if the key already exists.
+   */
+  add (key: string, value: Buffer | string, options?: StoreOptions): Promise<boolean> {
     return this.#store(TYPE_ADD, ' ME', key, value, options)
   }
 
-  cas (key, value, cas, options) {
+  /**
+   * Stores the value only if the current CAS token matches.
+   * Returns `false` on CAS mismatch or if the key does not exist.
+   */
+  cas (key: string, value: Buffer | string, cas: string | number | bigint, options?: StoreOptions): Promise<boolean> {
     return this.#store(TYPE_CAS, ` C${validateCas(cas)}`, key, value, options)
   }
 
-  delete (key, options) {
+  /**
+   * Deletes the key. Returns `false` on a miss, or on CAS mismatch when
+   * `options.cas` is provided.
+   */
+  delete (key: string, options?: DeleteOptions): Promise<boolean> {
     validateKey(key)
     const cas = options?.cas !== undefined ? ` C${validateCas(options.cas)}` : ''
     const opaque = this.#nextOpaque()
     return this.#connection.execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque)
   }
 
-  incr (key, delta = 1) {
+  /**
+   * Increments the numeric value of the key by delta (default 1).
+   * Returns the new value, or `null` if the key does not exist.
+   */
+  incr (key: string, delta: number | bigint = 1): Promise<bigint | null> {
     return this.#arithmetic('I', key, delta)
   }
 
-  decr (key, delta = 1) {
+  /**
+   * Decrements the numeric value of the key by delta (default 1), clamping
+   * at 0. Returns the new value, or `null` if the key does not exist.
+   */
+  decr (key: string, delta: number | bigint = 1): Promise<bigint | null> {
     return this.#arithmetic('D', key, delta)
   }
 
-  noop () {
+  /**
+   * Sends a meta no-op, useful as a pipeline fence.
+   */
+  noop (): Promise<void> {
     return this.#connection.execute(TYPE_NOOP, `mn${CRLF}`)
   }
 
-  version () {
+  /**
+   * Returns the server version string, useful as a health check.
+   */
+  version (): Promise<string> {
     return this.#connection.execute(TYPE_VERSION, `version${CRLF}`)
   }
 
-  close () {
+  /**
+   * Waits for in-flight commands to settle, then closes the connection.
+   */
+  close (): Promise<void> {
     return this.#connection.close()
   }
 
-  #store (type, extra, key, value, options) {
+  #store<T> (type: number, extra: string, key: string, value: Buffer | string, options?: StoreOptions): Promise<T> {
     validateKey(key)
-    value = validateValue(value)
+    const data = validateValue(value)
     const ttl = validateTTL(options?.ttl)
     const opaque = this.#nextOpaque()
 
     // Single buffer for header, data block and terminator: one socket write
-    const header = `ms ${key} ${value.length}${extra} T${ttl} O${opaque}${CRLF}`
-    const payload = Buffer.allocUnsafe(header.length + value.length + 2)
+    const header = `ms ${key} ${data.length}${extra} T${ttl} O${opaque}${CRLF}`
+    const payload = Buffer.allocUnsafe(header.length + data.length + 2)
     payload.write(header, 0, 'latin1')
-    value.copy(payload, header.length)
+    data.copy(payload, header.length)
     payload[payload.length - 2] = 13
     payload[payload.length - 1] = 10
 
     return this.#connection.execute(type, payload, opaque)
   }
 
-  #arithmetic (mode, key, delta) {
+  #arithmetic (mode: 'I' | 'D', key: string, delta: number | bigint): Promise<bigint | null> {
     validateKey(key)
-    delta = validateDelta(delta)
+    const encoded = validateDelta(delta)
     const opaque = this.#nextOpaque()
-    return this.#connection.execute(TYPE_ARITH, `ma ${key} v M${mode} D${delta} O${opaque}${CRLF}`, opaque)
+    return this.#connection.execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque)
   }
 
-  #nextOpaque () {
+  #nextOpaque (): string {
     this.#opaque = (this.#opaque + 1) & 0x3fffffff
     return this.#opaque.toString()
   }

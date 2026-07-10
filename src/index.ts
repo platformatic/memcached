@@ -1,0 +1,4 @@
+export { Client } from './client.ts'
+export type { DeleteOptions, GetsResult, ServerAddress, StoreOptions } from './client.ts'
+export type { ClientOptions } from './connection.ts'
+export { ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.ts'

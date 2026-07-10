@@ -1,17 +1,18 @@
 import { randomUUID } from 'node:crypto'
 import { connect } from 'node:net'
+import type { TestContext } from 'node:test'
 import { setTimeout as sleep } from 'node:timers/promises'
-import { Client } from '../index.js'
+import { Client, type ClientOptions, type ServerAddress } from '../src/index.ts'
 
 export const SERVER = process.env.MEMCACHED_URL ?? 'localhost:11211'
 
 // Waits for the Docker container port to accept connections
-export async function waitForServer (timeout = 10000) {
+export async function waitForServer (timeout = 10000): Promise<void> {
   const start = Date.now()
 
   while (true) {
     try {
-      await new Promise((resolve, reject) => {
+      await new Promise<void>((resolve, reject) => {
         const socket = connect(11211, 'localhost')
         socket.once('connect', () => {
           socket.destroy()
@@ -31,12 +32,12 @@ export async function waitForServer (timeout = 10000) {
   }
 }
 
-export function createClient (t, url = SERVER, options = {}) {
+export function createClient (t: TestContext, url: string | ServerAddress = SERVER, options: ClientOptions = {}): Client {
   const client = new Client(url, options)
   t.after(() => client.close())
   return client
 }
 
-export function testKey () {
+export function testKey (): string {
   return `test:${randomUUID()}`
 }
