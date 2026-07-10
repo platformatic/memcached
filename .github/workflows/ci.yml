@@ -22,17 +22,22 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
           node-version: ${{ matrix.node-version }}
+          cache: pnpm
       - name: Install dependencies
-        run: npm install
+        run: pnpm install --frozen-lockfile
       - name: Lint
-        run: npm run lint
+        run: pnpm run lint
+      - name: Typecheck
+        run: pnpm run typecheck
       - name: Start memcached with authentication
         run: |
-          chmod 644 test/fixtures/authfile
-          docker run -d --rm --name plt-memcached-auth-test -p 11214:11211 -v "$PWD/test/fixtures:/auth:ro" memcached:alpine memcached -Y /auth/authfile
+          chmod 644 packages/memcached/test/fixtures/authfile
+          docker run -d --rm --name plt-memcached-auth-test -p 11214:11211 -v "$PWD/packages/memcached/test/fixtures:/auth:ro" memcached:alpine memcached -Y /auth/authfile
       - name: Test
-        run: npm test
+        run: pnpm test
