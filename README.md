@@ -14,7 +14,8 @@ responses; the binary protocol is **deprecated** upstream. The meta protocol (me
 is the recommended replacement: compact single-line commands and responses, explicit flags,
 length-prefixed data blocks (binary-safe values), CAS on every command including delete, and
 opaque tokens for defensive response correlation. This client implements only the meta commands
-(`mg`, `ms`, `md`, `ma`, `mn`) plus `version` for health checks — nothing else.
+(`mg`, `ms`, `md`, `ma`, `mn`) plus `version` and `stats` for health checks and observability —
+nothing else.
 
 ## Design
 
@@ -134,6 +135,13 @@ Sends `mn`, useful as a pipeline fence.
 ### `client.version()` → `Promise<string>`
 
 Returns the server version string, useful as a health check.
+
+### `client.stats([subcommand])` → `Promise<Record<string, string>>`
+
+Returns server statistics as a name/value map, useful for observability: connection counts,
+evictions, `get_hits`/`get_misses`, memory usage and so on. An optional subcommand selects a
+specific domain, e.g. `stats('items')`, `stats('slabs')` or `stats('settings')`. Only
+`END`-terminated subcommands are supported (notably not `reset` or `cachedump`).
 
 ### `client.close()` → `Promise<void>`
 

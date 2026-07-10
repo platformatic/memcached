@@ -8,6 +8,7 @@ import {
   TYPE_GETS,
   TYPE_NOOP,
   TYPE_SET,
+  TYPE_STATS,
   TYPE_VERSION,
   type ClientOptions
 } from './connection.ts'
@@ -18,6 +19,8 @@ const CRLF = '\r\n'
 
 // Printable ASCII, no whitespace or control characters, at most 250 bytes
 const KEY_EXPRESSION = /^[\x21-\x7e]{1,250}$/
+// A stats subcommand is a single printable ASCII token
+const STATS_SUBCOMMAND_EXPRESSION = /^[\x21-\x7e]{1,250}$/
 const CAS_EXPRESSION = /^\d+$/
 
 export interface ServerAddress {
@@ -240,6 +243,28 @@ export class Client {
    */
   version (): Promise<string> {
     return this.#connection.execute(TYPE_VERSION, `version${CRLF}`)
+  }
+
+  /**
+   * Returns server statistics as a name/value map, useful for observability
+   * (connection counts, evictions, hit/miss ratios, memory usage).
+   *
+   * An optional subcommand selects a specific domain, e.g. `'items'`,
+   * `'slabs'` or `'settings'`. Only `END`-terminated subcommands are
+   * supported.
+   */
+  stats (subcommand?: string): Promise<Record<string, string>> {
+    if (subcommand === undefined) {
+      return this.#connection.execute(TYPE_STATS, `stats${CRLF}`)
+    }
+
+    if (typeof subcommand !== 'string' || !STATS_SUBCOMMAND_EXPRESSION.test(subcommand)) {
+      throw new ValidationError(
+        'The stats subcommand must be a non-empty string of at most 250 printable ASCII characters and cannot contain whitespace or control characters'
+      )
+    }
+
+    return this.#connection.execute(TYPE_STATS, `stats ${subcommand}${CRLF}`)
   }
 
   /**
