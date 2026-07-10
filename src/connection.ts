@@ -1,6 +1,6 @@
 import { EventEmitter } from 'node:events'
-import { connect } from 'node:net'
-import { ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.js'
+import { connect, type Socket } from 'node:net'
+import { ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.ts'
 
 export const TYPE_GET = 0
 export const TYPE_GETS = 1
@@ -27,37 +27,83 @@ const DEFAULT_CONNECT_TIMEOUT = 5000
 const DEFAULT_RECONNECT_DELAY = 100
 const DEFAULT_MAX_RECONNECT_DELAY = 5000
 
+export interface ClientOptions {
+  /**
+   * Milliseconds to wait for the TCP connection to be established.
+   * @default 5000
+   */
+  connectTimeout?: number
+
+  /**
+   * Initial reconnection delay in milliseconds. The delay doubles after each
+   * failed attempt.
+   * @default 100
+   */
+  reconnectDelay?: number
+
+  /**
+   * Maximum reconnection delay in milliseconds.
+   * @default 5000
+   */
+  maxReconnectDelay?: number
+
+  /**
+   * When commands corked for pipelining are flushed to the socket.
+   *
+   * - `'microtask'` (the default): at the next microtask checkpoint.
+   *   Coalesces commands issued in the same synchronous block and their
+   *   microtask cascade. Lowest latency for sparse traffic.
+   * - `'tick'` (or `true`): in the check phase (setImmediate) of the current
+   *   event loop iteration. Also coalesces commands issued from independent
+   *   async contexts (e.g. concurrent request handlers resuming from await)
+   *   into a single socket write, at the cost of slightly higher
+   *   per-command latency.
+   *
+   * `false` is an alias for `'microtask'`. Response ordering and correlation
+   * are identical in both modes.
+   *
+   * @default 'microtask'
+   */
+  autoPipelining?: 'microtask' | 'tick' | boolean
+}
+
+type Payload = string | Buffer
+
 // A single in-flight command. Memcached processes commands in order on a
 // connection, so a FIFO linked list of these is enough to correlate
 // responses. The opaque token is used to defensively verify correlation.
 class Pending {
-  constructor (type, opaque, payload) {
+  type: number
+  opaque: string | null
+  payload: Payload | null
+  sent = false
+  resolve!: (value: unknown) => void
+  reject!: (error: Error) => void
+  next: Pending | null = null
+
+  constructor (type: number, opaque: string | null, payload: Payload) {
     this.type = type
     this.opaque = opaque
     this.payload = payload
-    this.sent = false
-    this.resolve = null
-    this.reject = null
-    this.next = null
   }
 }
 
 export class Connection extends EventEmitter {
-  #host
-  #port
-  #connectTimeout
-  #reconnectDelay
-  #maxReconnectDelay
+  #host: string
+  #port: number
+  #connectTimeout: number
+  #reconnectDelay: number
+  #maxReconnectDelay: number
 
-  #socket = null
+  #socket: Socket | null = null
   #status = STATUS_CONNECTING
-  #lastError = null
+  #lastError: Error | null = null
   #reconnectAttempts = 0
-  #connectTimer = null
-  #reconnectTimer = null
+  #connectTimer: NodeJS.Timeout | undefined = undefined
+  #reconnectTimer: NodeJS.Timeout | undefined = undefined
   #corked = false
   #tickFlush = false
-  #flushImmediate = null
+  #flushImmediate: NodeJS.Immediate | null = null
 
   // Diagnostic counters: socket writes and actual flushes performed. Their
   // ratio is the average number of commands coalesced per syscall.
@@ -66,20 +112,20 @@ export class Connection extends EventEmitter {
 
   // FIFO of commands: a prefix of sent (in-flight) commands followed by
   // unsent ones, queued while the socket is not ready and flushed on connect
-  #head = null
-  #tail = null
+  #head: Pending | null = null
+  #tail: Pending | null = null
   #wasReady = false
 
   // Incremental response parser state
-  #buffer = EMPTY
+  #buffer: Buffer = EMPTY
   #state = STATE_LINE
-  #valueLine = null
+  #valueLine: string | null = null
   #valueNeeded = 0
 
-  #drainResolve = null
-  #closeResolve = null
+  #drainResolve: (() => void) | null = null
+  #closeResolve: (() => void) | null = null
 
-  constructor (host, port, options = {}) {
+  constructor (host: string, port: number, options: ClientOptions = {}) {
     super()
 
     this.#host = host
@@ -100,36 +146,36 @@ export class Connection extends EventEmitter {
     this.#connect()
   }
 
-  get socket () {
+  get socket (): Socket | null {
     return this.#socket
   }
 
-  get connected () {
+  get connected (): boolean {
     return this.#status === STATUS_READY
   }
 
-  get closed () {
+  get closed (): boolean {
     return this.#status === STATUS_CLOSED
   }
 
-  get writes () {
+  get writes (): number {
     return this.#writeCount
   }
 
-  get flushes () {
+  get flushes (): number {
     return this.#flushCount
   }
 
   // Sends a command and returns a promise settled when its response arrives.
   // payload is a latin1 string (line commands) or a Buffer (ms with data).
-  execute (type, payload, opaque = null) {
+  execute<T> (type: number, payload: Payload, opaque: string | null = null): Promise<T> {
     if (this.#status === STATUS_CLOSED) {
       return Promise.reject(new ConnectionError('Connection is closed'))
     }
 
     const pending = new Pending(type, opaque, payload)
-    const promise = new Promise((resolve, reject) => {
-      pending.resolve = resolve
+    const promise = new Promise<T>((resolve, reject) => {
+      pending.resolve = resolve as (value: unknown) => void
       pending.reject = reject
     })
 
@@ -149,7 +195,7 @@ export class Connection extends EventEmitter {
     return promise
   }
 
-  async close () {
+  async close (): Promise<void> {
     if (this.#status === STATUS_CLOSED) {
       return
     }
@@ -167,13 +213,13 @@ export class Connection extends EventEmitter {
 
     // Let in-flight commands settle before closing the socket
     if (this.#head !== null) {
-      await new Promise(resolve => {
+      await new Promise<void>(resolve => {
         this.#drainResolve = resolve
       })
     }
 
     if (this.#socket !== null) {
-      const closed = new Promise(resolve => {
+      const closed = new Promise<void>(resolve => {
         this.#closeResolve = resolve
       })
 
@@ -182,7 +228,7 @@ export class Connection extends EventEmitter {
     }
   }
 
-  #rejectAll (error) {
+  #rejectAll (error: Error) {
     let node = this.#head
     this.#head = null
     this.#tail = null
@@ -233,7 +279,7 @@ export class Connection extends EventEmitter {
     // Flush commands queued while the socket was not ready
     for (let node = this.#head; node !== null; node = node.next) {
       if (!node.sent) {
-        this.#write(node.payload)
+        this.#write(node.payload!)
         node.sent = true
         node.payload = null
       }
@@ -242,7 +288,7 @@ export class Connection extends EventEmitter {
     this.emit('connect')
   }
 
-  #onError = error => {
+  #onError = (error: Error) => {
     this.#lastError = error
   }
 
@@ -339,8 +385,8 @@ export class Connection extends EventEmitter {
   // check phase (setImmediate) of the current event loop iteration, also
   // coalescing commands issued from independent async contexts, like
   // concurrent request handlers resuming from await.
-  #write (payload) {
-    const socket = this.#socket
+  #write (payload: Payload) {
+    const socket = this.#socket!
 
     if (!this.#corked) {
       this.#corked = true
@@ -375,8 +421,8 @@ export class Connection extends EventEmitter {
 
   // Incremental parser: accumulates partial frames across TCP chunks and
   // never scans value bytes (which may contain \r\n) for line terminators.
-  #onData = chunk => {
-    const socket = this.#socket
+  #onData = (chunk: Buffer) => {
+    const socket = this.#socket!
     const buf = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk])
     const len = buf.length
     let offset = 0
@@ -430,7 +476,7 @@ export class Connection extends EventEmitter {
         buf.copy(value, 0, offset, end)
         offset = end + 2
 
-        const line = this.#valueLine
+        const line = this.#valueLine!
         this.#state = STATE_LINE
         this.#valueLine = null
         this.#valueNeeded = 0
@@ -450,11 +496,11 @@ export class Connection extends EventEmitter {
     }
   }
 
-  #complete (line, value) {
+  #complete (line: string, value: Buffer | null) {
     const pending = this.#head
 
     if (pending === null) {
-      this.#socket.destroy(new ProtocolError(`Received unexpected response: ${line}`))
+      this.#socket!.destroy(new ProtocolError(`Received unexpected response: ${line}`))
       return
     }
 
@@ -490,7 +536,7 @@ export class Connection extends EventEmitter {
           `Response correlation mismatch: expected opaque ${pending.opaque}, received ${mirrored}`
         )
         pending.reject(error)
-        this.#socket.destroy(error)
+        this.#socket!.destroy(error)
         return
       }
     }
@@ -521,7 +567,7 @@ export class Connection extends EventEmitter {
 
           pending.resolve({ value, cas })
         } else if (pending.type === TYPE_ARITH) {
-          pending.resolve(BigInt(value.toString('latin1')))
+          pending.resolve(BigInt(value!.toString('latin1')))
         } else {
           pending.reject(new ProtocolError(`Unexpected value response for command: ${line}`))
         }
@@ -566,7 +612,7 @@ export class Connection extends EventEmitter {
       default: {
         const error = new ProtocolError(`Received unknown response: ${line}`)
         pending.reject(error)
-        this.#socket.destroy(error)
+        this.#socket!.destroy(error)
       }
     }
   }

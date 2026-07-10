@@ -1,6 +1,6 @@
 import { deepStrictEqual, notStrictEqual, strictEqual, match, ok } from 'node:assert'
 import { before, test } from 'node:test'
-import { createClient, testKey, waitForServer } from './helper.js'
+import { createClient, testKey, waitForServer } from './helper.ts'
 
 before(() => waitForServer())
 
@@ -9,7 +9,7 @@ test('gets returns the value and an opaque CAS token', async t => {
   const key = testKey()
 
   await client.set(key, 'value')
-  const result = await client.gets(key)
+  const result = (await client.gets(key))!
 
   ok(Buffer.isBuffer(result.value))
   deepStrictEqual(result.value, Buffer.from('value'))
@@ -28,7 +28,7 @@ test('cas succeeds when the token matches', async t => {
   const key = testKey()
 
   await client.set(key, 'original')
-  const { cas } = await client.gets(key)
+  const { cas } = (await client.gets(key))!
 
   strictEqual(await client.cas(key, 'updated', cas), true)
   deepStrictEqual(await client.get(key), Buffer.from('updated'))
@@ -39,7 +39,7 @@ test('cas fails when the item was modified concurrently', async t => {
   const key = testKey()
 
   await client.set(key, 'original')
-  const { cas } = await client.gets(key)
+  const { cas } = (await client.gets(key))!
 
   // Simulate a concurrent writer
   await client.set(key, 'concurrent')
@@ -48,7 +48,7 @@ test('cas fails when the item was modified concurrently', async t => {
   deepStrictEqual(await client.get(key), Buffer.from('concurrent'))
 
   // The token changes after every write
-  const updated = await client.gets(key)
+  const updated = (await client.gets(key))!
   notStrictEqual(updated.cas, cas)
 })
 
@@ -63,7 +63,7 @@ test('CAS-guarded delete removes the item only when the token matches', async t 
   const key = testKey()
 
   await client.set(key, 'locked')
-  const { cas } = await client.gets(key)
+  const { cas } = (await client.gets(key))!
 
   strictEqual(await client.delete(key, { cas: '99999999' }), false)
   deepStrictEqual(await client.get(key), Buffer.from('locked'))
@@ -83,7 +83,7 @@ test('lock/unlock pattern: add + gets + CAS-guarded delete', async t => {
   strictEqual(await client.add(key, 'token-b', { ttl: 30 }), false)
 
   // Unlock with token verification
-  const current = await client.gets(key)
+  const current = (await client.gets(key))!
   deepStrictEqual(current.value, Buffer.from('token-a'))
   strictEqual(await client.delete(key, { cas: current.cas }), true)
 

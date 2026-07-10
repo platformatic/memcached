@@ -31,6 +31,11 @@ The performance approach follows [@platformatic/kafka](https://github.com/platfo
   cork/uncork.
 - Zero runtime dependencies: `node:net` and nothing else.
 
+The source is TypeScript under `src/`, written in the erasable subset so it runs directly on
+Node.js via [type stripping](https://nodejs.org/api/typescript.html) during development. The
+published package ships plain JavaScript plus declaration files compiled to `dist/`, so the
+runtime requirement for consumers stays Node.js >= 22.12.0.
+
 ## Requirements
 
 - Node.js >= 22.12.0 (both `import` and `require` work)
@@ -189,13 +194,18 @@ const client = new Client('localhost:11211', { autoPipelining: 'tick' })
 
 ## Testing
 
-Tests run against a real memcached via Docker. `npm test` starts a `memcached:alpine`
-container automatically (and stops it afterwards), or you can manage one yourself:
+Tests run against a real memcached via Docker. `npm test` builds `dist/`, starts a
+`memcached:alpine` container automatically (and stops it afterwards), or you can manage
+the container yourself:
 
 ```bash
 docker run -d --rm --name memcached -p 11211:11211 memcached:alpine
 npm test
 ```
+
+Tests are TypeScript executed directly by `node --test` through type stripping, so
+development requires Node.js >= 22.18.0 (or any 23.6+/24+); consuming the published
+package does not.
 
 ## Roadmap
 

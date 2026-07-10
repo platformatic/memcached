@@ -1,10 +1,10 @@
 import { throws } from 'node:assert'
-import { test } from 'node:test'
-import { Client, ValidationError } from '../index.js'
+import { test, type TestContext } from 'node:test'
+import { Client, ValidationError } from '../src/index.ts'
 
 // Validation is synchronous and happens before any I/O, no server is needed
 
-function createClient (t) {
+function createClient (t: TestContext) {
   const client = new Client('localhost:11211', { reconnectDelay: 10 })
   t.after(() => client.close())
   return client
@@ -12,6 +12,7 @@ function createClient (t) {
 
 test('rejects invalid server addresses', () => {
   throws(() => new Client(''), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => new Client(42), ValidationError)
   throws(() => new Client('memcached://'), ValidationError)
 })
@@ -25,6 +26,7 @@ test('rejects invalid keys', t => {
   throws(() => client.get('with\ttab'), ValidationError)
   throws(() => client.get('a'.repeat(251)), ValidationError)
   throws(() => client.get('non-ascii-é'), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.get(42), ValidationError)
   throws(() => client.set('bad key', 'value'), ValidationError)
   throws(() => client.delete('bad key'), ValidationError)
@@ -33,8 +35,11 @@ test('rejects invalid keys', t => {
 test('rejects invalid values', t => {
   const client = createClient(t)
 
+  // @ts-expect-error - invalid on purpose
   throws(() => client.set('key', 42), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.set('key', { object: true }), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.set('key', null), ValidationError)
 })
 
@@ -43,6 +48,7 @@ test('rejects invalid TTLs', t => {
 
   throws(() => client.set('key', 'value', { ttl: -1 }), ValidationError)
   throws(() => client.set('key', 'value', { ttl: 1.5 }), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.set('key', 'value', { ttl: 'soon' }), ValidationError)
 })
 
@@ -51,6 +57,7 @@ test('rejects invalid CAS tokens', t => {
 
   throws(() => client.cas('key', 'value', 'not-a-number'), ValidationError)
   throws(() => client.cas('key', 'value', ''), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.cas('key', 'value', undefined), ValidationError)
   throws(() => client.delete('key', { cas: 'abc' }), ValidationError)
 })
@@ -61,5 +68,6 @@ test('rejects invalid deltas', t => {
   throws(() => client.incr('key', 0), ValidationError)
   throws(() => client.incr('key', -5), ValidationError)
   throws(() => client.incr('key', 1.5), ValidationError)
+  // @ts-expect-error - invalid on purpose
   throws(() => client.decr('key', 'two'), ValidationError)
 })

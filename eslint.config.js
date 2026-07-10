@@ -1,6 +1,6 @@
 import neostandard from 'neostandard'
 
 export default neostandard({
-  ts: false,
-  ignores: ['node_modules/**']
+  ts: true,
+  ignores: ['node_modules/**', 'dist/**']
 })
