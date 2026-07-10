@@ -78,10 +78,12 @@ await client.close()
 
 ## API
 
-### `new Client(url, options)`
+### `new Client(servers, options)`
 
-- `url`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS),
-  `'memcached://user:pass@host:port'` or `{ host, port }`. Defaults to `'localhost:11211'`.
+- `servers`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS),
+  `'memcached://user:pass@host:port'`, `{ host, port }` or an array of those for client-side
+  sharding (see [Multiple servers](#multiple-servers-client-side-sharding)). Defaults to
+  `'localhost:11211'`.
 - `options.connectTimeout`: milliseconds to wait for the TCP connection (default `5000`).
 - `options.reconnectDelay`: initial reconnection backoff in milliseconds, doubled after each
   failed attempt (default `100`).
@@ -141,22 +143,26 @@ as a `bigint` (memcached counters are unsigned 64-bit), or `null` if the key doe
 
 ### `client.noop()` → `Promise<void>`
 
-Sends `mn`, useful as a pipeline fence.
+Sends `mn` to every server, useful as a pipeline fence.
 
 ### `client.version()` → `Promise<string>`
 
-Returns the server version string, useful as a health check.
+Returns the server version string, useful as a health check. With multiple servers, all of
+them are queried (a single unreachable node makes this reject) and the first server's
+version is returned.
 
 ### `client.stats([subcommand])` → `Promise<Record<string, string>>`
 
 Returns server statistics as a name/value map, useful for observability: connection counts,
 evictions, `get_hits`/`get_misses`, memory usage and so on. An optional subcommand selects a
 specific domain, e.g. `stats('items')`, `stats('slabs')` or `stats('settings')`. Only
-`END`-terminated subcommands are supported (notably not `reset` or `cachedump`).
+`END`-terminated subcommands are supported (notably not `reset` or `cachedump`). With
+multiple servers, the first server's stats are returned; per-node visibility needs a
+client per node.
 
 ### `client.close()` → `Promise<void>`
 
-Waits for in-flight commands to settle, then closes the connection. Idempotent. Commands
+Waits for in-flight commands to settle, then closes all connections. Idempotent. Commands
 issued after `close()` reject with `ConnectionError`.
 
 ### Errors
@@ -195,6 +201,30 @@ Two caveats:
   supported; providers that only offer SASL will not work with this client.
 - Credentials travel in plaintext on the wire. In production, pair authentication with
   TLS or a trusted network.
+
+## Multiple servers (client-side sharding)
+
+memcached has no server-side clustering protocol — nodes are share-nothing and unaware of
+each other — so sharding is a client concern. Pass an array of addresses to spread keys
+across nodes:
+
+```js
+const client = new Client(['cache1:11211', 'cache2:11211', 'cache3:11211'])
+```
+
+- Keys are routed with **ketama-style consistent hashing** (160 points per node on a 32-bit
+  md5 ring): adding or removing a node remaps only ~1/N of the keyspace, every other key
+  keeps its node.
+- One connection per node, each with its own pipelining, reconnection and backoff — exactly
+  as in single-server mode. A single server skips hashing entirely.
+- Routing is deterministic: every client instance given the same address list routes every
+  key to the same node, across processes and restarts.
+- **Node-down behavior is fail-fast per key range**: commands for keys owned by an
+  unreachable node reject with `ConnectionError` while the node's connection backs off and
+  reconnects; other nodes are unaffected. Keys are deliberately **not** rehashed to
+  surviving nodes, since that causes stale reads when the node comes back.
+- There is no cross-key atomicity — each key lives on exactly one node. A single hot key
+  still pins to one node by construction; sharding spreads aggregate load only.
 
 ## TTLs
 
@@ -255,8 +285,8 @@ package does not.
 
 ## Roadmap
 
-- Consistent hashing across multiple servers (multi-node support).
 - Optional connection pooling per server.
+- ElastiCache Auto Discovery (`config get cluster`) for dynamic node lists.
 
 ## License
 
