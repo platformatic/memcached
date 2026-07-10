@@ -80,8 +80,8 @@ await client.close()
 
 ### `new Client(url, options)`
 
-- `url`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS) or
-  `{ host, port }`. Defaults to `'localhost:11211'`.
+- `url`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS),
+  `'memcached://user:pass@host:port'` or `{ host, port }`. Defaults to `'localhost:11211'`.
 - `options.connectTimeout`: milliseconds to wait for the TCP connection (default `5000`).
 - `options.reconnectDelay`: initial reconnection backoff in milliseconds, doubled after each
   failed attempt (default `100`).
@@ -92,6 +92,11 @@ await client.close()
   URL scheme is shorthand for `tls: true`; an explicit options object still applies, so
   certificates can be configured either way. When connecting to an IP address the certificate
   hostname is not inferred: set `servername` explicitly. Default: `false` (plaintext).
+- `options.username` / `options.password`: credentials for ASCII (authfile)
+  authentication — see [Authentication](#authentication). Must be provided together, as
+  non-empty printable ASCII strings without whitespace. Credentials can also be embedded
+  in the URL (`memcached://user:pass@host:port`, percent-encoded); explicit options take
+  precedence over URL credentials.
 
 The constructor connects immediately in the background. Commands issued before the connection
 is established are queued and flushed on connect. On socket errors, all in-flight commands are
@@ -162,7 +167,34 @@ All errors extend `MemcachedError` and carry a `code`:
   commands after `close()`.
 - `ProtocolError` (`PLT_MEMCACHED_PROTOCOL_ERROR`): malformed or uncorrelated responses,
   `CLIENT_ERROR`/`SERVER_ERROR` from the server.
-- `ValidationError` (`PLT_MEMCACHED_VALIDATION_ERROR`): invalid keys, values, TTLs, CAS tokens.
+- `ValidationError` (`PLT_MEMCACHED_VALIDATION_ERROR`): invalid keys, values, TTLs, CAS
+  tokens, credentials.
+- `AuthenticationError` (`PLT_MEMCACHED_AUTH_ERROR`): the server rejected the configured
+  credentials.
+
+## Authentication
+
+memcached >= 1.6.6 supports ASCII authentication ("authfile mode"): start the server with
+`memcached -Y /path/to/authfile`, where the authfile contains `username:password` lines.
+Configure the client with matching credentials, either as options or in the URL:
+
+```js
+const client = new Client('localhost:11211', { username: 'user', password: 'secret' })
+// equivalent:
+const client2 = new Client('memcached://user:secret@localhost:11211')
+```
+
+The client authenticates as the first command on every connection — including automatic
+reconnections — before any queued command is flushed. If the server rejects the
+credentials, pending commands fail with `AuthenticationError` and the client keeps
+retrying in the background with the usual reconnection backoff.
+
+Two caveats:
+
+- SASL authentication rides the deprecated binary protocol and is intentionally **not**
+  supported; providers that only offer SASL will not work with this client.
+- Credentials travel in plaintext on the wire. In production, pair authentication with
+  TLS or a trusted network.
 
 ## TTLs
 

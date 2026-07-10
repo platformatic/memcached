@@ -1,7 +1,7 @@
 import { EventEmitter } from 'node:events'
 import { connect, type Socket } from 'node:net'
 import { connect as tlsConnect, type ConnectionOptions } from 'node:tls'
-import { ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.ts'
+import { AuthenticationError, ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.ts'
 
 export const TYPE_GET = 0
 export const TYPE_GETS = 1
@@ -13,6 +13,7 @@ export const TYPE_ARITH = 6
 export const TYPE_NOOP = 7
 export const TYPE_VERSION = 8
 export const TYPE_STATS = 9
+export const TYPE_AUTH = 10
 
 const STATUS_CONNECTING = 0
 const STATUS_READY = 1
@@ -76,9 +77,27 @@ export interface ClientOptions {
    * @default false
    */
   tls?: boolean | ConnectionOptions
+
+  /**
+   * Username for ASCII (authfile) authentication, available on
+   * memcached >= 1.6.6 started with `-Y <authfile>`. Must be provided
+   * together with `password`. Credentials are sent before any other command
+   * on every (re)connection. Printable ASCII only, no whitespace.
+   */
+  username?: string
+
+  /**
+   * Password for ASCII (authfile) authentication. Must be provided together
+   * with `username`. Printable ASCII only, no whitespace.
+   */
+  password?: string
 }
 
 type Payload = string | Buffer
+
+// Settlement callbacks for the internal authentication command: nobody awaits
+// it, success is silent and failure is propagated by rejecting user commands.
+function noop () {}
 
 // A single in-flight command. Memcached processes commands in order on a
 // connection, so a FIFO linked list of these is enough to correlate
@@ -105,6 +124,7 @@ export class Connection extends EventEmitter {
   #host: string
   #port: number
   #tls: ConnectionOptions | null
+  #authPayload: string | null = null
   #connectTimeout: number
   #reconnectDelay: number
   #maxReconnectDelay: number
@@ -158,6 +178,15 @@ export class Connection extends EventEmitter {
     this.#connectTimeout = options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
     this.#reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY
     this.#maxReconnectDelay = options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY
+
+    if (options.username !== undefined && options.password !== undefined) {
+      // ASCII (authfile) authentication rides a classic set command whose
+      // data block is "username password". The key is ignored by the server.
+      // Credentials are validated to printable ASCII by the client, so the
+      // latin1 string length equals the byte length.
+      const data = `${options.username} ${options.password}`
+      this.#authPayload = `set auth 0 0 ${data.length}\r\n${data}\r\n`
+    }
 
     const autoPipelining = options.autoPipelining ?? 'microtask'
     if (autoPipelining === true || autoPipelining === 'tick') {
@@ -308,6 +337,26 @@ export class Connection extends EventEmitter {
 
     this.#wasReady = true
     this.#reconnectAttempts = 0
+
+    // Authenticate before anything else: a server started with an authfile
+    // rejects every other command until the connection is authenticated, so
+    // the credentials must be the first command on every (re)connection,
+    // ahead of commands queued while disconnected.
+    if (this.#authPayload !== null) {
+      const auth = new Pending(TYPE_AUTH, null, this.#authPayload)
+      auth.resolve = noop
+      auth.reject = noop
+      auth.sent = true
+      auth.payload = null
+      auth.next = this.#head
+      this.#head = auth
+
+      if (this.#tail === null) {
+        this.#tail = auth
+      }
+
+      this.#write(this.#authPayload)
+    }
 
     // Flush commands queued while the socket was not ready
     for (let node = this.#head; node !== null; node = node.next) {
@@ -595,6 +644,21 @@ export class Connection extends EventEmitter {
         this.#socket!.destroy(error)
         return
       }
+    }
+
+    if (pending.type === TYPE_AUTH) {
+      if (code === 'STORED') {
+        pending.resolve(undefined)
+      } else {
+        // Fail fast: the server discards commands pipelined behind a failed
+        // authentication, so no responses are coming for them. Destroying
+        // the socket rejects every command already sent with this error.
+        const error = new AuthenticationError(`Authentication failed: ${line}`)
+        pending.reject(error)
+        this.#socket!.destroy(error)
+      }
+
+      return
     }
 
     switch (code) {

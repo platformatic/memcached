@@ -28,3 +28,9 @@ export class ValidationError extends MemcachedError {
     super(message, 'PLT_MEMCACHED_VALIDATION_ERROR', options)
   }
 }
+
+export class AuthenticationError extends MemcachedError {
+  constructor (message: string, options?: ErrorOptions) {
+    super(message, 'PLT_MEMCACHED_AUTH_ERROR', options)
+  }
+}
