@@ -65,6 +65,15 @@ export interface ClientOptions {
    * @default 'microtask'
    */
   autoPipelining?: 'microtask' | 'tick' | boolean
+
+  /**
+   * Number of connections opened to each server. Commands for a node are
+   * dispatched to the pool member with the fewest outstanding requests,
+   * so small operations do not queue behind large value transfers
+   * (head-of-line blocking).
+   * @default 1
+   */
+  poolSize?: number
 }
 
 type Payload = string | Buffer
@@ -114,6 +123,7 @@ export class Connection extends EventEmitter {
   // unsent ones, queued while the socket is not ready and flushed on connect
   #head: Pending | null = null
   #tail: Pending | null = null
+  #pending = 0
   #wasReady = false
 
   // Incremental response parser state
@@ -162,6 +172,12 @@ export class Connection extends EventEmitter {
     return this.#writeCount
   }
 
+  // Number of commands enqueued and not yet settled: the FIFO length. Used
+  // by the client for least-outstanding-requests dispatch across a pool.
+  get pending (): number {
+    return this.#pending
+  }
+
   get flushes (): number {
     return this.#flushCount
   }
@@ -185,6 +201,7 @@ export class Connection extends EventEmitter {
       this.#tail.next = pending
     }
     this.#tail = pending
+    this.#pending++
 
     if (this.#status === STATUS_READY && this.#socket !== null && !this.#socket.destroyed) {
       this.#write(payload)
@@ -232,6 +249,7 @@ export class Connection extends EventEmitter {
     let node = this.#head
     this.#head = null
     this.#tail = null
+    this.#pending = 0
 
     while (node !== null) {
       const next = node.next
@@ -336,6 +354,7 @@ export class Connection extends EventEmitter {
         const next = node.next
 
         if (node.sent) {
+          this.#pending--
           node.reject(error)
         } else {
           node.next = null
@@ -505,6 +524,7 @@ export class Connection extends EventEmitter {
     }
 
     this.#head = pending.next
+    this.#pending--
 
     if (this.#head === null) {
       this.#tail = null
