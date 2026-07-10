@@ -50,9 +50,9 @@ export interface GetsResult {
   cas: string
 }
 
-function parseAddress (url: string | ServerAddress): { host: string, port: number } {
+function parseAddress (url: string | ServerAddress): { host: string, port: number, secure: boolean } {
   if (typeof url === 'object' && url !== null) {
-    return { host: url.host ?? 'localhost', port: Number(url.port ?? DEFAULT_PORT) }
+    return { host: url.host ?? 'localhost', port: Number(url.port ?? DEFAULT_PORT), secure: false }
   }
 
   if (typeof url !== 'string' || url.length === 0) {
@@ -60,8 +60,12 @@ function parseAddress (url: string | ServerAddress): { host: string, port: numbe
   }
 
   let address = url
+  let secure = false
   if (address.startsWith('memcached://')) {
     address = address.slice(12)
+  } else if (address.startsWith('memcacheds://')) {
+    address = address.slice(13)
+    secure = true
   }
 
   let parsed
@@ -81,7 +85,7 @@ function parseAddress (url: string | ServerAddress): { host: string, port: numbe
     host = host.slice(1, -1)
   }
 
-  return { host, port: parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORT }
+  return { host, port: parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORT, secure }
 }
 
 function validateKey (key: string): void {
@@ -147,11 +151,19 @@ export class Client {
   /**
    * Creates a client connected to a single memcached server.
    *
-   * @param url `'host:port'`, `'memcached://host:port'` or `{ host, port }`.
+   * @param url `'host:port'`, `'memcached://host:port'`,
+   *            `'memcacheds://host:port'` (TLS) or `{ host, port }`.
    *            Defaults to `localhost:11211`.
    */
   constructor (url: string | ServerAddress = 'localhost:11211', options: ClientOptions = {}) {
-    const { host, port } = parseAddress(url)
+    const { host, port, secure } = parseAddress(url)
+
+    // The memcacheds:// scheme is shorthand for tls: true. An explicit tls
+    // options object still applies, so certificates can be configured.
+    if (secure && (typeof options.tls !== 'object' || options.tls === null)) {
+      options = { ...options, tls: true }
+    }
+
     this.#connection = new Connection(host, port, options)
   }
 

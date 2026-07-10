@@ -17,3 +17,8 @@ gotchas are listed here.
   `npm run build` before running it standalone. The other tests import `src/` directly and
   need no build.
 - `MEMCACHED_URL` overrides the server tests connect to (see `test/helper.js`).
+- `test/tls.test.ts` manages its own TLS memcached container (`plt-memcached-tls-test`, host
+  port 11213): it generates a self-signed certificate into the gitignored `test/fixtures/tls`
+  directory and starts/removes the container itself, so it also works standalone — but it
+  needs Docker and `openssl` on the PATH. The posttest hook removes the container as a
+  safety net if the test crashes.

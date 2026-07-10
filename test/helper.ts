@@ -7,13 +7,13 @@ import { Client, type ClientOptions, type ServerAddress } from '../src/index.ts'
 export const SERVER = process.env.MEMCACHED_URL ?? 'localhost:11211'
 
 // Waits for the Docker container port to accept connections
-export async function waitForServer (timeout = 10000): Promise<void> {
+export async function waitForServer (port = 11211, timeout = 10000): Promise<void> {
   const start = Date.now()
 
   while (true) {
     try {
       await new Promise<void>((resolve, reject) => {
-        const socket = connect(11211, 'localhost')
+        const socket = connect(port, 'localhost')
         socket.once('connect', () => {
           socket.destroy()
           resolve()
