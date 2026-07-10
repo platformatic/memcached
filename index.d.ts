@@ -19,6 +19,25 @@ export interface ClientOptions {
    * @default 5000
    */
   maxReconnectDelay?: number
+
+  /**
+   * When commands corked for pipelining are flushed to the socket.
+   *
+   * - `'microtask'` (the default): at the next microtask checkpoint.
+   *   Coalesces commands issued in the same synchronous block and their
+   *   microtask cascade. Lowest latency for sparse traffic.
+   * - `'tick'` (or `true`): in the check phase (setImmediate) of the current
+   *   event loop iteration. Also coalesces commands issued from independent
+   *   async contexts (e.g. concurrent request handlers resuming from await)
+   *   into a single socket write, at the cost of slightly higher
+   *   per-command latency.
+   *
+   * `false` is an alias for `'microtask'`. Response ordering and correlation
+   * are identical in both modes.
+   *
+   * @default 'microtask'
+   */
+  autoPipelining?: 'microtask' | 'tick' | boolean
 }
 
 export interface ServerAddress {

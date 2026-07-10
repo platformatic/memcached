@@ -158,7 +158,34 @@ than 30 days are interpreted as absolute Unix timestamps.
   and they share socket writes and round trips. There is no artificial batching layer and
   none is needed.
 - Run `npm run benchmark` (with a local memcached) to compare pipelined SET/GET throughput
-  against [memjs](https://github.com/memcachier/memjs).
+  against [memjs](https://github.com/memcachier/memjs), and
+  `node benchmarks/autopipelining.js` to compare the flush scheduling modes below under
+  concurrent independent issuers.
+
+### Auto-pipelining modes
+
+Outgoing commands are corked and flushed as a single `writev`. The `autoPipelining` option
+controls *when* the flush happens:
+
+- `'microtask'` (default): flush at the next microtask checkpoint. Commands issued in the
+  same synchronous block (and the microtask cascade it spawns) share one socket write.
+  A lone command is flushed practically immediately, so this is the lowest-latency choice
+  for sparse or bursty traffic.
+- `'tick'` (or `true`): flush in the check phase (`setImmediate`) of the current event loop
+  iteration, like ioredis' `enableAutoPipelining`. Commands issued from *independent* async
+  contexts in the same iteration — e.g. hundreds of concurrent request handlers resuming
+  from `await`, each issuing one `get` — coalesce into a single syscall instead of one write
+  per macrotask cascade. The trade-off is per-command latency: every command waits for the
+  remaining callbacks of the current iteration before hitting the wire, which is only worth
+  it when many concurrent issuers are active. With few in-flight commands prefer
+  `'microtask'`.
+
+Response ordering, FIFO correlation and opaque verification are identical in both modes;
+only the flush scheduling changes.
+
+```js
+const client = new Client('localhost:11211', { autoPipelining: 'tick' })
+```
 
 ## Testing
 
