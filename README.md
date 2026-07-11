@@ -21,9 +21,10 @@ nothing else.
 
 The performance approach follows [@platformatic/kafka](https://github.com/platformatic/kafka):
 
-- A single TCP connection per server with **full request pipelining**. memcached processes
-  commands on a connection strictly in order, so responses are correlated through a FIFO queue
-  of pending operations — no per-request locking or connection pooling needed.
+- A single TCP connection per server by default (optionally a small pool, see
+  [Connection pooling](#connection-pooling)) with **full request pipelining**. memcached
+  processes commands on a connection strictly in order, so responses are correlated through a
+  FIFO queue of pending operations — no per-request locking needed.
 - Every command carries an **opaque token** (`O` flag) which the server mirrors back; the client
   verifies it to detect protocol desynchronization instead of silently returning wrong data.
 - An **incremental, Buffer-based response parser**: partial frames are carried across TCP chunks
@@ -88,6 +89,8 @@ await client.close()
 - `options.reconnectDelay`: initial reconnection backoff in milliseconds, doubled after each
   failed attempt (default `100`).
 - `options.maxReconnectDelay`: backoff cap in milliseconds (default `5000`).
+- `options.poolSize`: connections opened per server (default `1`, see
+  [Connection pooling](#connection-pooling)).
 - `options.tls`: connect over TLS. Pass `true` for the default TLS configuration, or a
   [`node:tls` connect options](https://nodejs.org/api/tls.html#tlsconnectoptions-callback)
   object (`ca`, `cert`, `key`, `servername`, `rejectUnauthorized`, ...). The `memcacheds://`
@@ -215,8 +218,9 @@ const client = new Client(['cache1:11211', 'cache2:11211', 'cache3:11211'])
 - Keys are routed with **ketama-style consistent hashing** (160 points per node on a 32-bit
   md5 ring): adding or removing a node remaps only ~1/N of the keyspace, every other key
   keeps its node.
-- One connection per node, each with its own pipelining, reconnection and backoff — exactly
-  as in single-server mode. A single server skips hashing entirely.
+- One connection per node (or `poolSize` connections, see
+  [Connection pooling](#connection-pooling)), each with its own pipelining, reconnection and
+  backoff — exactly as in single-server mode. A single server skips hashing entirely.
 - Routing is deterministic: every client instance given the same address list routes every
   key to the same node, across processes and restarts.
 - **Node-down behavior is fail-fast per key range**: commands for keys owned by an
@@ -268,6 +272,30 @@ only the flush scheduling changes.
 const client = new Client('localhost:11211', { autoPipelining: 'tick' })
 ```
 
+### Connection pooling
+
+The memcached protocol has no request multiplexing: responses come back strictly in request
+order, so a pipelined connection is subject to **head-of-line blocking** — a single large
+value transfer holds the line while sub-millisecond gets queue behind it. Since memcached
+binds each connection to one worker thread but is multithreaded across connections, opening
+several connections also buys genuine server-side parallelism.
+
+Set `poolSize` to open that many connections per server:
+
+```js
+const client = new Client('localhost:11211', { poolSize: 4 })
+```
+
+- Each command is dispatched to the pool member with the **fewest outstanding requests**, so
+  small operations flow around a connection busy with a bulk transfer. FIFO correlation and
+  opaque verification are unchanged per connection.
+- Pooling composes with sharding: `poolSize` connections are opened per node, and keys are
+  still routed to nodes first.
+- Auto-pipelining batching happens per pooled connection, after dispatch.
+- The default of `1` keeps today's behavior and memory footprint. Mind fleet sizing: each
+  server sees `clients × poolSize` connections, and memcached's connection limit (`-c`,
+  default 1024) must be raised accordingly.
+
 ## Testing
 
 Tests run against a real memcached via Docker. `npm test` builds `dist/`, starts a
@@ -285,7 +313,6 @@ package does not.
 
 ## Roadmap
 
-- Optional connection pooling per server.
 - ElastiCache Auto Discovery (`config get cluster`) for dynamic node lists.
 
 ## License

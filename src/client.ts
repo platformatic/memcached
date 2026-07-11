@@ -192,7 +192,9 @@ function validateDelta (delta: number | bigint): string {
 }
 
 export class Client {
+  // All connections, node-major: the pool for node n starts at n * poolSize
   #connections: Connection[]
+  #poolSize: number
   #ring: HashRing | null
   #opaque = 0
 
@@ -227,7 +229,15 @@ export class Client {
       seen.add(id)
     }
 
-    this.#connections = addresses.map(({ host, port, secure, username, password }) => {
+    const poolSize = options.poolSize ?? 1
+    if (!Number.isSafeInteger(poolSize) || poolSize < 1) {
+      throw new ValidationError('The poolSize option must be a positive integer')
+    }
+
+    this.#poolSize = poolSize
+    this.#connections = []
+
+    for (const { host, port, secure, username, password } of addresses) {
       let connectionOptions = options
 
       // The memcacheds:// scheme is shorthand for tls: true, per address so
@@ -243,8 +253,11 @@ export class Client {
           ? validateCredentials(options.username, options.password)
           : validateCredentials(username, password)
 
-      return new Connection(host, port, { ...connectionOptions, ...credentials })
-    })
+      for (let i = 0; i < poolSize; i++) {
+        this.#connections.push(new Connection(host, port, { ...connectionOptions, ...credentials }))
+      }
+    }
+
     this.#ring = addresses.length > 1 ? new HashRing(addresses) : null
   }
 
@@ -327,15 +340,16 @@ export class Client {
   }
 
   /**
-   * Sends a meta no-op to every server, useful as a pipeline fence.
+   * Sends a meta no-op to every connection of every server, useful as a
+   * pipeline fence.
    */
   async noop (): Promise<void> {
     await Promise.all(this.#connections.map(connection => connection.execute<void>(TYPE_NOOP, `mn${CRLF}`)))
   }
 
   /**
-   * Returns the server version string, useful as a health check. With
-   * multiple servers all of them are queried (so a single unreachable node
+   * Returns the server version string, useful as a health check. Every
+   * connection of every server is queried (so a single unreachable node
    * makes this reject) and the first server's version is returned.
    */
   async version (): Promise<string> {
@@ -399,9 +413,28 @@ export class Client {
     return this.#connectionFor(key).execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque)
   }
 
-  // Key to node routing: a single server bypasses hashing entirely
+  // Key to node routing: a single server bypasses hashing entirely. Within a
+  // node's pool the connection with the fewest outstanding commands is
+  // picked, so small operations do not queue behind large value transfers.
   #connectionFor (key: string): Connection {
-    return this.#ring === null ? this.#connections[0] : this.#connections[this.#ring.lookup(key)]
+    const node = this.#ring === null ? 0 : this.#ring.lookup(key)
+
+    if (this.#poolSize === 1) {
+      return this.#connections[node]
+    }
+
+    const base = node * this.#poolSize
+    let best = this.#connections[base]
+
+    for (let i = 1; i < this.#poolSize; i++) {
+      const candidate = this.#connections[base + i]
+
+      if (candidate.pending < best.pending) {
+        best = candidate
+      }
+    }
+
+    return best
   }
 
   #nextOpaque (): string {

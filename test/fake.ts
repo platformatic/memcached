@@ -21,8 +21,13 @@ function mirror (tokens: string[], from: number): string {
  */
 export class FakeMemcached {
   store = new Map<string, Buffer>()
+  // Keys whose mg responses are delayed by the given milliseconds, to
+  // simulate slow value transfers in pooling tests
+  delays = new Map<string, number>()
   noops = 0
   versions = 0
+  // Total sockets ever accepted, to observe pool sizes
+  connections = 0
   port = 0
 
   #server: Server
@@ -30,12 +35,31 @@ export class FakeMemcached {
 
   constructor () {
     this.#server = createServer(socket => {
+      this.connections++
       this.#sockets.add(socket)
       socket.on('close', () => this.#sockets.delete(socket))
 
       let buffer: Buffer = Buffer.alloc(0)
+      let queue: Promise<void> = Promise.resolve()
+
+      // Serialized writer: responses leave in command order even when some
+      // are artificially delayed, matching real memcached semantics
+      const reply = (delay: number, chunks: Array<string | Buffer>) => {
+        queue = queue.then(async () => {
+          if (delay > 0) {
+            await new Promise(resolve => setTimeout(resolve, delay))
+          }
+
+          if (!socket.destroyed) {
+            for (const chunk of chunks) {
+              socket.write(chunk)
+            }
+          }
+        })
+      }
+
       socket.on('data', chunk => {
-        buffer = this.#process(socket, Buffer.concat([buffer, chunk]))
+        buffer = this.#process(reply, Buffer.concat([buffer, chunk]))
       })
     })
   }
@@ -60,7 +84,7 @@ export class FakeMemcached {
     })
   }
 
-  #process (socket: Socket, buffer: Buffer): Buffer {
+  #process (reply: (delay: number, chunks: Array<string | Buffer>) => void, buffer: Buffer): Buffer {
     while (true) {
       const idx = buffer.indexOf(CRLF)
 
@@ -82,7 +106,7 @@ export class FakeMemcached {
         }
 
         this.store.set(tokens[1], Buffer.from(buffer.subarray(idx + 2, idx + 2 + size)))
-        socket.write(`HD${mirror(tokens, 3)}${CRLF}`)
+        reply(0, [`HD${mirror(tokens, 3)}${CRLF}`])
         buffer = buffer.subarray(end)
         continue
       }
@@ -91,26 +115,25 @@ export class FakeMemcached {
 
       if (command === 'mg') {
         const value = this.store.get(tokens[1])
+        const delay = this.delays.get(tokens[1]) ?? 0
 
         if (value === undefined) {
-          socket.write(`EN${mirror(tokens, 2)}${CRLF}`)
+          reply(delay, [`EN${mirror(tokens, 2)}${CRLF}`])
         } else if (tokens.includes('v')) {
-          socket.write(`VA ${value.length}${mirror(tokens, 2)}${CRLF}`)
-          socket.write(value)
-          socket.write(CRLF)
+          reply(delay, [`VA ${value.length}${mirror(tokens, 2)}${CRLF}`, value, CRLF])
         } else {
-          socket.write(`HD${mirror(tokens, 2)}${CRLF}`)
+          reply(delay, [`HD${mirror(tokens, 2)}${CRLF}`])
         }
       } else if (command === 'md') {
-        socket.write(`${this.store.delete(tokens[1]) ? 'HD' : 'NF'}${mirror(tokens, 2)}${CRLF}`)
+        reply(0, [`${this.store.delete(tokens[1]) ? 'HD' : 'NF'}${mirror(tokens, 2)}${CRLF}`])
       } else if (command === 'mn') {
         this.noops++
-        socket.write(`MN${CRLF}`)
+        reply(0, [`MN${CRLF}`])
       } else if (command === 'version') {
         this.versions++
-        socket.write(`VERSION 1.6.0-fake${CRLF}`)
+        reply(0, [`VERSION 1.6.0-fake${CRLF}`])
       } else {
-        socket.write(`ERROR${CRLF}`)
+        reply(0, [`ERROR${CRLF}`])
       }
     }
   }
