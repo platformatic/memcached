@@ -1,5 +1,6 @@
 import { EventEmitter } from 'node:events'
 import { connect, type Socket } from 'node:net'
+import { connect as tlsConnect, type ConnectionOptions } from 'node:tls'
 import { ConnectionError, MemcachedError, ProtocolError, ValidationError } from './errors.ts'
 
 export const TYPE_GET = 0
@@ -66,6 +67,15 @@ export interface ClientOptions {
    * @default 'microtask'
    */
   autoPipelining?: 'microtask' | 'tick' | boolean
+
+  /**
+   * Connect over TLS. Pass `true` to use the default TLS configuration, or a
+   * `node:tls` connect options object (`ca`, `cert`, `key`, `servername`,
+   * `rejectUnauthorized`, ...). Note that when connecting to an IP address
+   * the certificate hostname is not inferred: set `servername` explicitly.
+   * @default false
+   */
+  tls?: boolean | ConnectionOptions
 }
 
 type Payload = string | Buffer
@@ -94,6 +104,7 @@ class Pending {
 export class Connection extends EventEmitter {
   #host: string
   #port: number
+  #tls: ConnectionOptions | null
   #connectTimeout: number
   #reconnectDelay: number
   #maxReconnectDelay: number
@@ -133,6 +144,17 @@ export class Connection extends EventEmitter {
 
     this.#host = host
     this.#port = port
+    const tls = options.tls ?? false
+    if (tls === true) {
+      this.#tls = {}
+    } else if (tls === false) {
+      this.#tls = null
+    } else if (typeof tls === 'object' && tls !== null) {
+      this.#tls = tls
+    } else {
+      throw new ValidationError('The tls option must be a boolean or an object of TLS connect options')
+    }
+
     this.#connectTimeout = options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
     this.#reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY
     this.#maxReconnectDelay = options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY
@@ -253,7 +275,13 @@ export class Connection extends EventEmitter {
     this.#status = STATUS_CONNECTING
     this.#wasReady = false
 
-    const socket = connect({ host: this.#host, port: this.#port, noDelay: true })
+    let socket: Socket
+    if (this.#tls !== null) {
+      socket = tlsConnect({ host: this.#host, port: this.#port, ...this.#tls })
+      socket.setNoDelay(true)
+    } else {
+      socket = connect({ host: this.#host, port: this.#port, noDelay: true })
+    }
     this.#socket = socket
 
     this.#connectTimer = setTimeout(() => {
@@ -261,7 +289,9 @@ export class Connection extends EventEmitter {
     }, this.#connectTimeout)
     this.#connectTimer.unref()
 
-    socket.on('connect', this.#onConnect)
+    // TLS sockets become usable once the handshake completes ('secureConnect'),
+    // not when the TCP connection is established ('connect')
+    socket.on(this.#tls !== null ? 'secureConnect' : 'connect', this.#onConnect)
     socket.on('data', this.#onData)
     socket.on('error', this.#onError)
     socket.on('close', this.#onClose)

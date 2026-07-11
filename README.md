@@ -80,12 +80,18 @@ await client.close()
 
 ### `new Client(url, options)`
 
-- `url`: `'host:port'`, `'memcached://host:port'` or `{ host, port }`. Defaults to
-  `'localhost:11211'`.
+- `url`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS) or
+  `{ host, port }`. Defaults to `'localhost:11211'`.
 - `options.connectTimeout`: milliseconds to wait for the TCP connection (default `5000`).
 - `options.reconnectDelay`: initial reconnection backoff in milliseconds, doubled after each
   failed attempt (default `100`).
 - `options.maxReconnectDelay`: backoff cap in milliseconds (default `5000`).
+- `options.tls`: connect over TLS. Pass `true` for the default TLS configuration, or a
+  [`node:tls` connect options](https://nodejs.org/api/tls.html#tlsconnectoptions-callback)
+  object (`ca`, `cert`, `key`, `servername`, `rejectUnauthorized`, ...). The `memcacheds://`
+  URL scheme is shorthand for `tls: true`; an explicit options object still applies, so
+  certificates can be configured either way. When connecting to an IP address the certificate
+  hostname is not inferred: set `servername` explicitly. Default: `false` (plaintext).
 
 The constructor connects immediately in the background. Commands issued before the connection
 is established are queued and flushed on connect. On socket errors, all in-flight commands are
@@ -219,7 +225,6 @@ package does not.
 
 - Consistent hashing across multiple servers (multi-node support).
 - Optional connection pooling per server.
-- TLS support.
 
 ## License
 

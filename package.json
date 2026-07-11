@@ -26,7 +26,7 @@
     "prepack": "npm run build",
     "pretest": "npm run build && (docker run -d --rm --name plt-memcached-test -p 11211:11211 memcached:alpine > /dev/null 2>&1 || true)",
     "test": "node --test --test-concurrency=1 test/*.test.ts test/*.test.cjs",
-    "posttest": "docker rm -f plt-memcached-test > /dev/null 2>&1 || true",
+    "posttest": "docker rm -f plt-memcached-test plt-memcached-tls-test > /dev/null 2>&1 || true",
     "benchmark": "node benchmarks/compare.js"
   },
   "repository": {
