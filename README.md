@@ -14,6 +14,7 @@ This repository is a [pnpm](https://pnpm.io/) workspace.
 | Package | Description |
 | --- | --- |
 | [`@platformatic/memcached`](./packages/memcached) | The memcached client: meta protocol, full request pipelining, zero runtime dependencies. |
+| [`@platformatic/memcached-otel`](./packages/memcached-otel) | OpenTelemetry tracing instrumentation for the client, built on its diagnostics channels. |
 
 See each package's README for full documentation.
 

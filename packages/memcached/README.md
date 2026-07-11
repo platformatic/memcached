@@ -419,7 +419,7 @@ five standard channels:
 
 The same payload object flows through every event of a command, following
 `diagnostics_channel.tracingChannel()` semantics — tracing integrations (e.g. OpenTelemetry
-spans, issue [#8](https://github.com/platformatic/memcached/issues/8)) can attach state to it
+spans via [`@platformatic/memcached-otel`](../memcached-otel)) can attach state to it
 and get exactly one logical span per command, regardless of how auto-pipelining batches
 writes. The payload shape (`CommandDiagnosticsContext`):
 
@@ -446,7 +446,7 @@ Connection lifecycle events are published on plain channels, with `{ host, port 
   payload also carries `attempt` (1-based, resets on success) and `delayMs` (backoff before
   the attempt). Time-to-reconnect is the gap between this event and the next `connect`.
 
-An OpenTelemetry recipe recording a latency histogram (spans are #8 territory; histograms
+An OpenTelemetry recipe recording a latency histogram (spans are [`@platformatic/memcached-otel`](../memcached-otel) territory; histograms
 only need one subscription):
 
 ```js

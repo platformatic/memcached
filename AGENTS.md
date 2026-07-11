@@ -35,5 +35,8 @@ This is a pnpm workspace: packages live under `packages/*` (core client in
 - `packages/memcached/test/interop.test.cjs` requires the **built** package (`dist/`), not
   `src/`; run `pnpm build` before running it standalone. The other tests import `src/`
   directly and need no build.
-- `MEMCACHED_URL` overrides the server tests connect to (see
-  `packages/memcached/test/helper.ts`).
+- `MEMCACHED_URL` overrides the server tests connect to (see each package's
+  `test/helper.ts`).
+- `packages/memcached-otel` tests import the core client from its **built** `dist/`
+  (workspace link); its pretest builds the core package, but running its test files
+  standalone requires `pnpm --filter @platformatic/memcached build` first.
