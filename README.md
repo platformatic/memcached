@@ -102,6 +102,9 @@ await client.close()
   non-empty printable ASCII strings without whitespace. Credentials can also be embedded
   in the URL (`memcached://user:pass@host:port`, percent-encoded); explicit options take
   precedence over URL credentials.
+- `options.diagnosticsIncludeKeys`: include the command key in diagnostics channel payloads
+  (default `false`, keys may carry sensitive data — see
+  [Metrics and diagnostics](#metrics-and-diagnostics)).
 
 The constructor connects immediately in the background. Commands issued before the connection
 is established are queued and flushed on connect. On socket errors, all in-flight commands are
@@ -162,6 +165,11 @@ specific domain, e.g. `stats('items')`, `stats('slabs')` or `stats('settings')`.
 `END`-terminated subcommands are supported (notably not `reset` or `cachedump`). With
 multiple servers, the first server's stats are returned; per-node visibility needs a
 client per node.
+
+### `client.metrics()` → `ClientMetrics`
+
+Returns a snapshot of client-side metrics (plain object, synchronous). See
+[Metrics and diagnostics](#metrics-and-diagnostics) for the full field reference.
 
 ### `client.close()` → `Promise<void>`
 
@@ -295,6 +303,168 @@ const client = new Client('localhost:11211', { poolSize: 4 })
 - The default of `1` keeps today's behavior and memory footprint. Mind fleet sizing: each
   server sees `clients × poolSize` connections, and memcached's connection limit (`-c`,
   default 1024) must be raised accordingly.
+
+## Metrics and diagnostics
+
+The client exposes observability data through two exporter-agnostic surfaces, both nearly
+free when unused. Wiring them into Prometheus, OpenTelemetry or anything else is up to you;
+the package keeps zero runtime dependencies.
+
+### `client.metrics()`
+
+Returns a plain-object snapshot of monotonic counters and current gauges, aggregated across
+the client's connections. The cost of collection is plain integer increments on code paths
+the client already executes, so it is always on.
+
+```js
+{
+  commands: {
+    issued: 0,     // accepted by the client (past argument validation)
+    completed: 0,  // settled successfully, including misses
+    failed: 0,     // rejected (connection, protocol or server errors)
+    byVerb: {      // the same three counters per wire verb; all verbs are
+      mg: { issued: 0, completed: 0, failed: 0 },  // always present
+      ms: { issued: 0, completed: 0, failed: 0 },
+      md: { issued: 0, completed: 0, failed: 0 },
+      ma: { issued: 0, completed: 0, failed: 0 },
+      mn: { issued: 0, completed: 0, failed: 0 },
+      version: { issued: 0, completed: 0, failed: 0 },
+      stats: { issued: 0, completed: 0, failed: 0 },
+      auth: { issued: 0, completed: 0, failed: 0 }
+    }
+  },
+  pipeline: {
+    pendingDepth: 0,  // gauge: commands in flight or queued right now
+    writes: 0,        // socket write() calls
+    flushes: 0        // cork/uncork flushes (writev syscalls)
+  },
+  connection: {
+    connects: 0,           // successful TCP connects
+    disconnects: 0,        // closes of established connections
+    reconnectAttempts: 0   // reconnection attempts scheduled
+  },
+  bytes: {
+    read: 0,     // bytes received from the server
+    written: 0   // bytes written to the socket
+  }
+}
+```
+
+Field semantics:
+
+- `commands.issued` counts every command accepted by the client, including commands queued
+  while disconnected and commands rejected because the client is closed. Argument validation
+  errors (invalid key, TTL, CAS, ...) throw before the command exists and are not counted.
+- `commands.completed` counts resolved commands: hits, misses and conditional stores/deletes
+  that did not apply all complete. `commands.failed` counts rejections. The invariant
+  `issued === completed + failed + pendingDepth` always holds.
+- `pipeline.pendingDepth` is a gauge (not monotonic): the current length of the pending
+  FIFO, i.e. commands awaiting a response plus commands queued while disconnected. A value
+  that stays high indicates head-of-line blocking or an unreachable server.
+- `pipeline.writes / pipeline.flushes` is the average number of commands coalesced per
+  syscall by [auto-pipelining](#auto-pipelining-modes).
+- `connection.disconnects` counts closes of *established* connections (including the one
+  performed by `close()`); failed connection attempts surface in
+  `connection.reconnectAttempts` instead.
+- Latencies are deliberately not aggregated here: per-command durations flow through the
+  diagnostics channels below, so the consumer chooses buckets, summaries or spans.
+
+Snapshot fields, channel names and payload shapes are a **stable API**. Future multi-node
+and pooling support will add labels/dimensions rather than change this shape.
+
+A Prometheus recipe, reading the snapshot lazily at scrape time via `collect()`:
+
+```js
+import { Gauge } from 'prom-client'
+import { Client } from '@platformatic/memcached'
+
+const memcached = new Client('localhost:11211')
+
+new Gauge({
+  name: 'memcached_client_commands_total',
+  help: 'Commands issued by the memcached client',
+  labelNames: ['verb', 'state'],
+  collect () {
+    const { commands } = memcached.metrics()
+    for (const [verb, counters] of Object.entries(commands.byVerb)) {
+      this.labels(verb, 'completed').set(counters.completed)
+      this.labels(verb, 'failed').set(counters.failed)
+    }
+  }
+})
+
+new Gauge({
+  name: 'memcached_client_pending_depth',
+  help: 'Commands awaiting a response',
+  collect () {
+    this.set(memcached.metrics().pipeline.pendingDepth)
+  }
+})
+```
+
+### Diagnostics channels
+
+Per-operation events are published on [`node:diagnostics_channel`](https://nodejs.org/api/diagnostics_channel.html),
+so subscribers only pay when subscribed: with no subscribers the client skips all payload
+allocation and publishing.
+
+Commands use a **tracing channel** named `platformatic.memcached.command`, which exposes the
+five standard channels:
+
+- `tracing:platformatic.memcached.command:start` — the command was issued.
+- `tracing:platformatic.memcached.command:end` — the synchronous issue phase finished.
+- `tracing:platformatic.memcached.command:error` — the command failed (published before the
+  settlement events).
+- `tracing:platformatic.memcached.command:asyncStart` / `:asyncEnd` — the command settled.
+
+The same payload object flows through every event of a command, following
+`diagnostics_channel.tracingChannel()` semantics — tracing integrations (e.g. OpenTelemetry
+spans, issue [#8](https://github.com/platformatic/memcached/issues/8)) can attach state to it
+and get exactly one logical span per command, regardless of how auto-pipelining batches
+writes. The payload shape (`CommandDiagnosticsContext`):
+
+| Field | Set on | Description |
+| --- | --- | --- |
+| `verb` | start | Wire verb: `mg`, `ms`, `md`, `ma`, `mn` or `version` |
+| `host`, `port` | start | Server address |
+| `requestSize` | start | Serialized command size in bytes, data block included |
+| `key` | start | Only with `diagnosticsIncludeKeys: true` |
+| `outcome` | settlement | `'success'`, `'miss'` (not found, or conditional store/delete not applied) or `'error'` |
+| `durationMs` | settlement | Milliseconds from issue to settlement (`performance.now()` based) |
+| `responseSize` | settlement | Value size in bytes, when the response carried one |
+| `error` | settlement | The rejection error, when `outcome` is `'error'` |
+
+Keys and values may carry sensitive data, so payloads never include values, and include keys
+only when the client is created with `diagnosticsIncludeKeys: true`.
+
+Connection lifecycle events are published on plain channels, with `{ host, port }` payloads:
+
+- `platformatic.memcached.connection.connect` — the connection is established and ready.
+- `platformatic.memcached.connection.disconnect` — an established connection closed; the
+  payload also carries `error` (why it closed, a `ConnectionError` for deliberate `close()`).
+- `platformatic.memcached.connection.reconnect` — a reconnection attempt was scheduled; the
+  payload also carries `attempt` (1-based, resets on success) and `delayMs` (backoff before
+  the attempt). Time-to-reconnect is the gap between this event and the next `connect`.
+
+An OpenTelemetry recipe recording a latency histogram (spans are #8 territory; histograms
+only need one subscription):
+
+```js
+import { subscribe } from 'node:diagnostics_channel'
+import { metrics } from '@opentelemetry/api'
+
+const meter = metrics.getMeter('memcached-client')
+const duration = meter.createHistogram('memcached.client.operation.duration', { unit: 'ms' })
+
+subscribe('tracing:platformatic.memcached.command:asyncEnd', ctx => {
+  duration.record(ctx.durationMs, {
+    'db.operation.name': ctx.verb,
+    'server.address': ctx.host,
+    'server.port': ctx.port,
+    'db.response.status': ctx.outcome
+  })
+})
+```
 
 ## Testing
 

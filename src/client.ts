@@ -10,6 +10,7 @@ import {
   TYPE_SET,
   TYPE_STATS,
   TYPE_VERSION,
+  type ClientMetrics,
   type ClientOptions
 } from './connection.ts'
 import { ValidationError } from './errors.ts'
@@ -277,7 +278,7 @@ export class Client {
   get (key: string): Promise<Buffer | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -286,7 +287,7 @@ export class Client {
   gets (key: string): Promise<GetsResult | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -320,7 +321,7 @@ export class Client {
     validateKey(key)
     const cas = options?.cas !== undefined ? ` C${validateCas(options.cas)}` : ''
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -357,6 +358,26 @@ export class Client {
       this.#connections.map(connection => connection.execute<string>(TYPE_VERSION, `version${CRLF}`))
     )
     return versions[0]
+  }
+
+  /**
+   * Returns a snapshot of client metrics: monotonic counters plus the
+   * current pending-queue depth, aggregated across every connection of
+   * every server (all pool members of all nodes).
+   */
+  metrics (): ClientMetrics {
+    const snapshot: ClientMetrics = {
+      commands: { issued: 0, completed: 0, failed: 0, byVerb: {} },
+      pipeline: { pendingDepth: 0, writes: 0, flushes: 0 },
+      connection: { connects: 0, disconnects: 0, reconnectAttempts: 0 },
+      bytes: { read: 0, written: 0 }
+    }
+
+    for (const connection of this.#connections) {
+      connection.collectMetrics(snapshot)
+    }
+
+    return snapshot
   }
 
   /**
@@ -403,14 +424,14 @@ export class Client {
     payload[payload.length - 2] = 13
     payload[payload.length - 1] = 10
 
-    return this.#connectionFor(key).execute(type, payload, opaque)
+    return this.#connectionFor(key).execute(type, payload, opaque, key)
   }
 
   #arithmetic (mode: 'I' | 'D', key: string, delta: number | bigint): Promise<bigint | null> {
     validateKey(key)
     const encoded = validateDelta(delta)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque, key)
   }
 
   // Key to node routing: a single server bypasses hashing entirely. Within a

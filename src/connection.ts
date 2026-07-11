@@ -1,3 +1,4 @@
+import { channel, tracingChannel } from 'node:diagnostics_channel'
 import { EventEmitter } from 'node:events'
 import { connect, type Socket } from 'node:net'
 import { connect as tlsConnect, type ConnectionOptions } from 'node:tls'
@@ -15,6 +16,9 @@ export const TYPE_VERSION = 8
 export const TYPE_STATS = 9
 export const TYPE_AUTH = 10
 
+// Wire verb labels indexed by command type, used for metrics and diagnostics
+const VERBS = ['mg', 'mg', 'ms', 'ms', 'ms', 'md', 'ma', 'mn', 'version', 'stats', 'auth']
+
 const STATUS_CONNECTING = 0
 const STATUS_READY = 1
 const STATUS_CLOSED = 2
@@ -29,6 +33,89 @@ const LF = 10
 const DEFAULT_CONNECT_TIMEOUT = 5000
 const DEFAULT_RECONNECT_DELAY = 100
 const DEFAULT_MAX_RECONNECT_DELAY = 5000
+
+/**
+ * Per-command payload published on the `platformatic.memcached.command`
+ * tracing channel. The same object flows through the whole event sequence
+ * of a command; `outcome`, `durationMs`, `responseSize` and `error` are set
+ * before the settlement events (`asyncStart`, `asyncEnd`, `error`) fire.
+ */
+export interface CommandDiagnosticsContext {
+  /** Wire verb: 'mg', 'ms', 'md', 'ma', 'mn' or 'version'. */
+  verb: string
+  host: string
+  port: number
+  /** Size in bytes of the serialized command, including data block. */
+  requestSize: number
+  /** Only present when the client was created with `diagnosticsIncludeKeys: true`. */
+  key?: string
+  /**
+   * 'success', 'miss' (key not found, or a conditional store/delete that did
+   * not apply) or 'error' (rejection).
+   */
+  outcome?: 'success' | 'miss' | 'error'
+  /** Wall-clock milliseconds from issuing the command to its settlement. */
+  durationMs?: number
+  /** Size in bytes of the returned value, when the command returned one. */
+  responseSize?: number
+  /** Only present when outcome is 'error'. */
+  error?: Error
+}
+
+/**
+ * Payload published on the `platformatic.memcached.connection.*` channels.
+ */
+export interface ConnectionDiagnosticsEvent {
+  host: string
+  port: number
+  /** disconnect only: why the connection closed. */
+  error?: Error
+  /** reconnect only: 1-based attempt number since the last successful connect. */
+  attempt?: number
+  /** reconnect only: backoff delay before the attempt, in milliseconds. */
+  delayMs?: number
+}
+
+export interface VerbMetrics {
+  issued: number
+  completed: number
+  failed: number
+}
+
+/**
+ * Snapshot returned by `client.metrics()`: monotonic counters plus the
+ * `pendingDepth` gauge, aggregated across the client's connections.
+ */
+export interface ClientMetrics {
+  commands: {
+    issued: number
+    completed: number
+    failed: number
+    byVerb: Record<string, VerbMetrics>
+  }
+  pipeline: {
+    pendingDepth: number
+    writes: number
+    flushes: number
+  }
+  connection: {
+    connects: number
+    disconnects: number
+    reconnectAttempts: number
+  }
+  bytes: {
+    read: number
+    written: number
+  }
+}
+
+// Diagnostics channels. Channel names and payload shapes are a stable API,
+// shared between metrics consumers and tracing integrations. Payloads are
+// only allocated when at least one subscriber is present.
+const commandChannel = tracingChannel<unknown, CommandDiagnosticsContext>('platformatic.memcached.command')
+const connectChannel = channel('platformatic.memcached.connection.connect')
+const disconnectChannel = channel('platformatic.memcached.connection.disconnect')
+const reconnectChannel = channel('platformatic.memcached.connection.reconnect')
 
 export interface ClientOptions {
   /**
@@ -100,6 +187,14 @@ export interface ClientOptions {
    * @default 1
    */
   poolSize?: number
+
+  /**
+   * Include the command key in the payloads published on the
+   * `platformatic.memcached.command` diagnostics channel. Off by default
+   * because keys may carry sensitive data.
+   * @default false
+   */
+  diagnosticsIncludeKeys?: boolean
 }
 
 type Payload = string | Buffer
@@ -121,6 +216,10 @@ class Pending {
   resolve!: (value: unknown) => void
   reject!: (error: Error) => void
   next: Pending | null = null
+
+  // Set only when the command tracing channel has subscribers
+  ctx: CommandDiagnosticsContext | null = null
+  startTime = 0
 
   constructor (type: number, opaque: string | null, payload: Payload) {
     this.type = type
@@ -153,11 +252,22 @@ export class Connection extends EventEmitter {
   #writeCount = 0
   #flushCount = 0
 
+  // Metrics: plain integer counters incremented on paths already executed
+  // per command, so the overhead is near zero. #typeCounters is indexed by
+  // command type; #pendingDepth is a gauge tracking the FIFO length.
+  #typeCounters: VerbMetrics[] = []
+  #pendingDepth = 0
+  #connectCount = 0
+  #disconnectCount = 0
+  #reconnectTotal = 0
+  #bytesRead = 0
+  #bytesWritten = 0
+  #includeKeys: boolean
+
   // FIFO of commands: a prefix of sent (in-flight) commands followed by
   // unsent ones, queued while the socket is not ready and flushed on connect
   #head: Pending | null = null
   #tail: Pending | null = null
-  #pending = 0
   #wasReady = false
 
   // Incremental response parser state
@@ -188,6 +298,11 @@ export class Connection extends EventEmitter {
     this.#connectTimeout = options.connectTimeout ?? DEFAULT_CONNECT_TIMEOUT
     this.#reconnectDelay = options.reconnectDelay ?? DEFAULT_RECONNECT_DELAY
     this.#maxReconnectDelay = options.maxReconnectDelay ?? DEFAULT_MAX_RECONNECT_DELAY
+    this.#includeKeys = options.diagnosticsIncludeKeys === true
+
+    for (let i = 0; i < VERBS.length; i++) {
+      this.#typeCounters.push({ issued: 0, completed: 0, failed: 0 })
+    }
 
     if (options.username !== undefined && options.password !== undefined) {
       // ASCII (authfile) authentication rides a classic set command whose
@@ -229,7 +344,7 @@ export class Connection extends EventEmitter {
   // Number of commands enqueued and not yet settled: the FIFO length. Used
   // by the client for least-outstanding-requests dispatch across a pool.
   get pending (): number {
-    return this.#pending
+    return this.#pendingDepth
   }
 
   get flushes (): number {
@@ -238,9 +353,28 @@ export class Connection extends EventEmitter {
 
   // Sends a command and returns a promise settled when its response arrives.
   // payload is a latin1 string (line commands) or a Buffer (ms with data).
-  execute<T> (type: number, payload: Payload, opaque: string | null = null): Promise<T> {
+  // The key is only used for diagnostics and only when opted in.
+  execute<T> (type: number, payload: Payload, opaque: string | null = null, key: string | null = null): Promise<T> {
+    const counters = this.#typeCounters[type]
+    counters.issued++
+
     if (this.#status === STATUS_CLOSED) {
-      return Promise.reject(new ConnectionError('Connection is closed'))
+      counters.failed++
+      const error = new ConnectionError('Connection is closed')
+
+      if (commandChannel.start.hasSubscribers) {
+        const ctx = this.#commandContext(type, payload, key)
+        commandChannel.start.publish(ctx)
+        commandChannel.end.publish(ctx)
+        ctx.outcome = 'error'
+        ctx.durationMs = 0
+        ctx.error = error
+        commandChannel.error.publish(ctx)
+        commandChannel.asyncStart.publish(ctx)
+        commandChannel.asyncEnd.publish(ctx)
+      }
+
+      return Promise.reject(error)
     }
 
     const pending = new Pending(type, opaque, payload)
@@ -249,13 +383,20 @@ export class Connection extends EventEmitter {
       pending.reject = reject
     })
 
+    this.#pendingDepth++
+
+    if (commandChannel.start.hasSubscribers) {
+      pending.ctx = this.#commandContext(type, payload, key)
+      pending.startTime = performance.now()
+      commandChannel.start.publish(pending.ctx)
+    }
+
     if (this.#tail === null) {
       this.#head = pending
     } else {
       this.#tail.next = pending
     }
     this.#tail = pending
-    this.#pending++
 
     if (this.#status === STATUS_READY && this.#socket !== null && !this.#socket.destroyed) {
       this.#write(payload)
@@ -263,7 +404,101 @@ export class Connection extends EventEmitter {
       pending.payload = null
     }
 
+    if (pending.ctx !== null) {
+      commandChannel.end.publish(pending.ctx)
+    }
+
     return promise
+  }
+
+  // Adds this connection's counters into the snapshot. Implemented as an
+  // aggregation so a future multi-connection client can sum across
+  // connections without changing the shape.
+  collectMetrics (target: ClientMetrics): void {
+    for (let i = 0; i < VERBS.length; i++) {
+      const source = this.#typeCounters[i]
+      const verb = VERBS[i]
+      let entry = target.commands.byVerb[verb]
+
+      if (entry === undefined) {
+        entry = { issued: 0, completed: 0, failed: 0 }
+        target.commands.byVerb[verb] = entry
+      }
+
+      entry.issued += source.issued
+      entry.completed += source.completed
+      entry.failed += source.failed
+      target.commands.issued += source.issued
+      target.commands.completed += source.completed
+      target.commands.failed += source.failed
+    }
+
+    target.pipeline.pendingDepth += this.#pendingDepth
+    target.pipeline.writes += this.#writeCount
+    target.pipeline.flushes += this.#flushCount
+    target.connection.connects += this.#connectCount
+    target.connection.disconnects += this.#disconnectCount
+    target.connection.reconnectAttempts += this.#reconnectTotal
+    target.bytes.read += this.#bytesRead
+    target.bytes.written += this.#bytesWritten
+  }
+
+  #commandContext (type: number, payload: Payload, key: string | null): CommandDiagnosticsContext {
+    const ctx: CommandDiagnosticsContext = {
+      verb: VERBS[type],
+      host: this.#host,
+      port: this.#port,
+      requestSize: payload.length
+    }
+
+    if (this.#includeKeys && key !== null) {
+      ctx.key = key
+    }
+
+    return ctx
+  }
+
+  // Every command settles exactly once through one of these two methods,
+  // whatever the path: response parsing, connection failure or teardown.
+  #settleResolve (pending: Pending, value: unknown) {
+    this.#pendingDepth--
+    this.#typeCounters[pending.type].completed++
+
+    const ctx = pending.ctx
+    if (ctx !== null) {
+      pending.ctx = null
+      ctx.outcome = value === null || value === false ? 'miss' : 'success'
+      ctx.durationMs = performance.now() - pending.startTime
+
+      if (Buffer.isBuffer(value)) {
+        ctx.responseSize = value.length
+      } else if (typeof value === 'object' && value !== null && Buffer.isBuffer((value as { value?: unknown }).value)) {
+        ctx.responseSize = (value as { value: Buffer }).value.length
+      }
+
+      commandChannel.asyncStart.publish(ctx)
+      commandChannel.asyncEnd.publish(ctx)
+    }
+
+    pending.resolve(value)
+  }
+
+  #settleReject (pending: Pending, error: Error) {
+    this.#pendingDepth--
+    this.#typeCounters[pending.type].failed++
+
+    const ctx = pending.ctx
+    if (ctx !== null) {
+      pending.ctx = null
+      ctx.outcome = 'error'
+      ctx.durationMs = performance.now() - pending.startTime
+      ctx.error = error
+      commandChannel.error.publish(ctx)
+      commandChannel.asyncStart.publish(ctx)
+      commandChannel.asyncEnd.publish(ctx)
+    }
+
+    pending.reject(error)
   }
 
   async close (): Promise<void> {
@@ -303,11 +538,10 @@ export class Connection extends EventEmitter {
     let node = this.#head
     this.#head = null
     this.#tail = null
-    this.#pending = 0
 
     while (node !== null) {
       const next = node.next
-      node.reject(error)
+      this.#settleReject(node, error)
       node = next
     }
 
@@ -355,6 +589,11 @@ export class Connection extends EventEmitter {
 
     this.#wasReady = true
     this.#reconnectAttempts = 0
+    this.#connectCount++
+
+    if (connectChannel.hasSubscribers) {
+      connectChannel.publish({ host: this.#host, port: this.#port } satisfies ConnectionDiagnosticsEvent)
+    }
 
     // Authenticate before anything else: a server started with an authfile
     // rejects every other command until the connection is authenticated, so
@@ -372,6 +611,11 @@ export class Connection extends EventEmitter {
       if (this.#tail === null) {
         this.#tail = auth
       }
+
+      // The auth command bypasses execute(), so it is counted as issued here
+      // to keep the metrics invariant (it settles through the settle helpers)
+      this.#typeCounters[TYPE_AUTH].issued++
+      this.#pendingDepth++
 
       this.#write(this.#authPayload)
     }
@@ -419,6 +663,16 @@ export class Connection extends EventEmitter {
         ? cause
         : new ConnectionError(`Connection to ${this.#host}:${this.#port} closed`, cause ? { cause } : undefined)
 
+    // An established connection was lost (or deliberately closed). Failed
+    // connection attempts are not disconnects: they surface as reconnects.
+    if (this.#wasReady) {
+      this.#disconnectCount++
+
+      if (disconnectChannel.hasSubscribers) {
+        disconnectChannel.publish({ host: this.#host, port: this.#port, error } satisfies ConnectionDiagnosticsEvent)
+      }
+    }
+
     // Reject every command already sent: memcached may have partially
     // processed them, so retrying transparently would not be safe. Commands
     // still queued (issued while disconnected) are kept and will be flushed
@@ -436,8 +690,7 @@ export class Connection extends EventEmitter {
         const next = node.next
 
         if (node.sent) {
-          this.#pending--
-          node.reject(error)
+          this.#settleReject(node, error)
         } else {
           node.next = null
 
@@ -477,6 +730,17 @@ export class Connection extends EventEmitter {
     // This also guarantees queued commands are not abandoned mid-flight.
     const delay = Math.min(this.#reconnectDelay * 2 ** this.#reconnectAttempts, this.#maxReconnectDelay)
     this.#reconnectAttempts++
+    this.#reconnectTotal++
+
+    if (reconnectChannel.hasSubscribers) {
+      reconnectChannel.publish({
+        host: this.#host,
+        port: this.#port,
+        attempt: this.#reconnectAttempts,
+        delayMs: delay
+      } satisfies ConnectionDiagnosticsEvent)
+    }
+
     this.#reconnectTimer = setTimeout(() => this.#connect(), delay)
   }
 
@@ -501,6 +765,8 @@ export class Connection extends EventEmitter {
     }
 
     this.#writeCount++
+    // Payload strings are latin1, so length is the byte size in both cases
+    this.#bytesWritten += payload.length
 
     if (typeof payload === 'string') {
       socket.write(payload, 'latin1')
@@ -523,6 +789,8 @@ export class Connection extends EventEmitter {
   // Incremental parser: accumulates partial frames across TCP chunks and
   // never scans value bytes (which may contain \r\n) for line terminators.
   #onData = (chunk: Buffer) => {
+    this.#bytesRead += chunk.length
+
     const socket = this.#socket!
     const buf = this.#buffer.length === 0 ? chunk : Buffer.concat([this.#buffer, chunk])
     const len = buf.length
@@ -600,7 +868,6 @@ export class Connection extends EventEmitter {
   // Dequeues the head command once its response is complete
   #dequeue (pending: Pending) {
     this.#head = pending.next
-    this.#pending--
 
     if (this.#head === null) {
       this.#tail = null
@@ -660,7 +927,7 @@ export class Connection extends EventEmitter {
         const error = new ProtocolError(
           `Response correlation mismatch: expected opaque ${pending.opaque}, received ${mirrored}`
         )
-        pending.reject(error)
+        this.#settleReject(pending, error)
         this.#socket!.destroy(error)
         return
       }
@@ -668,13 +935,13 @@ export class Connection extends EventEmitter {
 
     if (pending.type === TYPE_AUTH) {
       if (code === 'STORED') {
-        pending.resolve(undefined)
+        this.#settleResolve(pending, undefined)
       } else {
         // Fail fast: the server discards commands pipelined behind a failed
         // authentication, so no responses are coming for them. Destroying
         // the socket rejects every command already sent with this error.
         const error = new AuthenticationError(`Authentication failed: ${line}`)
-        pending.reject(error)
+        this.#settleReject(pending, error)
         this.#socket!.destroy(error)
       }
 
@@ -684,16 +951,16 @@ export class Connection extends EventEmitter {
     switch (code) {
       case 'HD':
         if (pending.type === TYPE_SET) {
-          pending.resolve(undefined)
+          this.#settleResolve(pending, undefined)
         } else if (pending.type === TYPE_ARITH) {
-          pending.resolve(null)
+          this.#settleResolve(pending, null)
         } else {
-          pending.resolve(true)
+          this.#settleResolve(pending, true)
         }
         break
       case 'VA':
         if (pending.type === TYPE_GET) {
-          pending.resolve(value)
+          this.#settleResolve(pending, value)
         } else if (pending.type === TYPE_GETS) {
           let cas = null
 
@@ -705,44 +972,44 @@ export class Connection extends EventEmitter {
             }
           }
 
-          pending.resolve({ value, cas })
+          this.#settleResolve(pending, { value, cas })
         } else if (pending.type === TYPE_ARITH) {
-          pending.resolve(BigInt(value!.toString('latin1')))
+          this.#settleResolve(pending, BigInt(value!.toString('latin1')))
         } else {
-          pending.reject(new ProtocolError(`Unexpected value response for command: ${line}`))
+          this.#settleReject(pending, new ProtocolError(`Unexpected value response for command: ${line}`))
         }
         break
       case 'EN': // miss
-        pending.resolve(null)
+        this.#settleResolve(pending, null)
         break
       case 'NF': // not found
         if (pending.type === TYPE_ARITH) {
-          pending.resolve(null)
+          this.#settleResolve(pending, null)
         } else if (pending.type === TYPE_SET) {
-          pending.reject(new MemcachedError('Item not found', 'PLT_MEMCACHED_NOT_STORED'))
+          this.#settleReject(pending, new MemcachedError('Item not found', 'PLT_MEMCACHED_NOT_STORED'))
         } else {
-          pending.resolve(false)
+          this.#settleResolve(pending, false)
         }
         break
       case 'NS': // not stored
         if (pending.type === TYPE_SET) {
-          pending.reject(new MemcachedError('Item not stored', 'PLT_MEMCACHED_NOT_STORED'))
+          this.#settleReject(pending, new MemcachedError('Item not stored', 'PLT_MEMCACHED_NOT_STORED'))
         } else {
-          pending.resolve(false)
+          this.#settleResolve(pending, false)
         }
         break
       case 'EX': // exists, CAS mismatch
         if (pending.type === TYPE_SET) {
-          pending.reject(new MemcachedError('Item exists', 'PLT_MEMCACHED_NOT_STORED'))
+          this.#settleReject(pending, new MemcachedError('Item exists', 'PLT_MEMCACHED_NOT_STORED'))
         } else {
-          pending.resolve(false)
+          this.#settleResolve(pending, false)
         }
         break
       case 'MN':
-        pending.resolve(undefined)
+        this.#settleResolve(pending, undefined)
         break
       case 'VERSION':
-        pending.resolve(line.slice(8))
+        this.#settleResolve(pending, line.slice(8))
         break
       case 'END':
         if (pending.type === TYPE_STATS) {
@@ -756,11 +1023,11 @@ export class Connection extends EventEmitter {
       case 'ERROR':
       case 'CLIENT_ERROR':
       case 'SERVER_ERROR':
-        pending.reject(new ProtocolError(`Server returned an error: ${line}`))
+        this.#settleReject(pending, new ProtocolError(`Server returned an error: ${line}`))
         break
       default: {
         const error = new ProtocolError(`Received unknown response: ${line}`)
-        pending.reject(error)
+        this.#settleReject(pending, error)
         this.#socket!.destroy(error)
       }
     }
