@@ -13,6 +13,7 @@ import {
   type ClientOptions
 } from './connection.ts'
 import { ValidationError } from './errors.ts'
+import { HashRing } from './ring.ts'
 
 const DEFAULT_PORT = 11211
 const CRLF = '\r\n'
@@ -191,38 +192,70 @@ function validateDelta (delta: number | bigint): string {
 }
 
 export class Client {
-  #connection: Connection
+  #connections: Connection[]
+  #ring: HashRing | null
   #opaque = 0
 
   /**
-   * Creates a client connected to a single memcached server.
+   * Creates a client. Pass a single address to talk to one server, or an
+   * array of addresses to shard keys across several servers with
+   * ketama-style consistent hashing (see the README for the routing and
+   * failure semantics).
    *
-   * @param url `'host:port'`, `'memcached://host:port'`,
-   *            `'memcacheds://host:port'` (TLS),
-   *            `'memcached://user:pass@host:port'` or `{ host, port }`.
-   *            Defaults to `localhost:11211`.
+   * @param servers `'host:port'`, `'memcached://host:port'`,
+   *                `'memcacheds://host:port'` (TLS),
+   *                `'memcached://user:pass@host:port'`, `{ host, port }`
+   *                or an array of those. Defaults to `localhost:11211`.
    */
-  constructor (url: string | ServerAddress = 'localhost:11211', options: ClientOptions = {}) {
-    const { host, port, secure, username, password } = parseAddress(url)
+  constructor (servers: string | ServerAddress | Array<string | ServerAddress> = 'localhost:11211', options: ClientOptions = {}) {
+    const list = Array.isArray(servers) ? servers : [servers]
 
-    // The memcacheds:// scheme is shorthand for tls: true. An explicit tls
-    // options object still applies, so certificates can be configured.
-    if (secure && (typeof options.tls !== 'object' || options.tls === null)) {
-      options = { ...options, tls: true }
+    if (list.length === 0) {
+      throw new ValidationError('At least one server address must be provided')
     }
 
-    // Explicit options take precedence over credentials embedded in the URL
-    const credentials =
-      options.username !== undefined || options.password !== undefined
-        ? validateCredentials(options.username, options.password)
-        : validateCredentials(username, password)
+    const addresses = list.map(parseAddress)
+    const seen = new Set<string>()
 
-    this.#connection = new Connection(host, port, { ...options, ...credentials })
+    for (const { host, port } of addresses) {
+      const id = `${host}:${port}`
+
+      if (seen.has(id)) {
+        throw new ValidationError(`Duplicate server address: ${id}`)
+      }
+
+      seen.add(id)
+    }
+
+    this.#connections = addresses.map(({ host, port, secure, username, password }) => {
+      let connectionOptions = options
+
+      // The memcacheds:// scheme is shorthand for tls: true, per address so
+      // mixed fleets are possible. An explicit tls options object still
+      // applies, so certificates can be configured.
+      if (secure && (typeof connectionOptions.tls !== 'object' || connectionOptions.tls === null)) {
+        connectionOptions = { ...connectionOptions, tls: true }
+      }
+
+      // Explicit options take precedence over credentials embedded in the URL
+      const credentials =
+        options.username !== undefined || options.password !== undefined
+          ? validateCredentials(options.username, options.password)
+          : validateCredentials(username, password)
+
+      return new Connection(host, port, { ...connectionOptions, ...credentials })
+    })
+    this.#ring = addresses.length > 1 ? new HashRing(addresses) : null
   }
 
   // Internal, exposed for tests only
   get connection (): Connection {
-    return this.#connection
+    return this.#connections[0]
+  }
+
+  // Internal, exposed for tests only
+  get connections (): Connection[] {
+    return this.#connections
   }
 
   /**
@@ -231,7 +264,7 @@ export class Client {
   get (key: string): Promise<Buffer | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connection.execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque)
   }
 
   /**
@@ -240,7 +273,7 @@ export class Client {
   gets (key: string): Promise<GetsResult | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connection.execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque)
   }
 
   /**
@@ -274,7 +307,7 @@ export class Client {
     validateKey(key)
     const cas = options?.cas !== undefined ? ` C${validateCas(options.cas)}` : ''
     const opaque = this.#nextOpaque()
-    return this.#connection.execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque)
   }
 
   /**
@@ -294,17 +327,22 @@ export class Client {
   }
 
   /**
-   * Sends a meta no-op, useful as a pipeline fence.
+   * Sends a meta no-op to every server, useful as a pipeline fence.
    */
-  noop (): Promise<void> {
-    return this.#connection.execute(TYPE_NOOP, `mn${CRLF}`)
+  async noop (): Promise<void> {
+    await Promise.all(this.#connections.map(connection => connection.execute<void>(TYPE_NOOP, `mn${CRLF}`)))
   }
 
   /**
-   * Returns the server version string, useful as a health check.
+   * Returns the server version string, useful as a health check. With
+   * multiple servers all of them are queried (so a single unreachable node
+   * makes this reject) and the first server's version is returned.
    */
-  version (): Promise<string> {
-    return this.#connection.execute(TYPE_VERSION, `version${CRLF}`)
+  async version (): Promise<string> {
+    const versions = await Promise.all(
+      this.#connections.map(connection => connection.execute<string>(TYPE_VERSION, `version${CRLF}`))
+    )
+    return versions[0]
   }
 
   /**
@@ -313,11 +351,12 @@ export class Client {
    *
    * An optional subcommand selects a specific domain, e.g. `'items'`,
    * `'slabs'` or `'settings'`. Only `END`-terminated subcommands are
-   * supported.
+   * supported. With multiple servers, the first server's stats are returned;
+   * per-node visibility needs a client per node.
    */
   stats (subcommand?: string): Promise<Record<string, string>> {
     if (subcommand === undefined) {
-      return this.#connection.execute(TYPE_STATS, `stats${CRLF}`)
+      return this.#connections[0].execute(TYPE_STATS, `stats${CRLF}`)
     }
 
     if (typeof subcommand !== 'string' || !STATS_SUBCOMMAND_EXPRESSION.test(subcommand)) {
@@ -326,14 +365,14 @@ export class Client {
       )
     }
 
-    return this.#connection.execute(TYPE_STATS, `stats ${subcommand}${CRLF}`)
+    return this.#connections[0].execute(TYPE_STATS, `stats ${subcommand}${CRLF}`)
   }
 
   /**
-   * Waits for in-flight commands to settle, then closes the connection.
+   * Waits for in-flight commands to settle, then closes all connections.
    */
-  close (): Promise<void> {
-    return this.#connection.close()
+  async close (): Promise<void> {
+    await Promise.all(this.#connections.map(connection => connection.close()))
   }
 
   #store<T> (type: number, extra: string, key: string, value: Buffer | string, options?: StoreOptions): Promise<T> {
@@ -350,14 +389,19 @@ export class Client {
     payload[payload.length - 2] = 13
     payload[payload.length - 1] = 10
 
-    return this.#connection.execute(type, payload, opaque)
+    return this.#connectionFor(key).execute(type, payload, opaque)
   }
 
   #arithmetic (mode: 'I' | 'D', key: string, delta: number | bigint): Promise<bigint | null> {
     validateKey(key)
     const encoded = validateDelta(delta)
     const opaque = this.#nextOpaque()
-    return this.#connection.execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque)
+    return this.#connectionFor(key).execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque)
+  }
+
+  // Key to node routing: a single server bypasses hashing entirely
+  #connectionFor (key: string): Connection {
+    return this.#ring === null ? this.#connections[0] : this.#connections[this.#ring.lookup(key)]
   }
 
   #nextOpaque (): string {
