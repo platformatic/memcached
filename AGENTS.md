@@ -13,6 +13,12 @@ gotchas are listed here.
 - Running a single file (`node --test test/basic.test.ts`) skips the pretest hook — start a
   container yourself first: `docker run -d --rm --name memcached -p 11211:11211 memcached:alpine`.
   Don't name it `plt-memcached-test`, or the next `npm test` posttest will remove it.
+- `test/auth.test.ts` needs a second, auth-enabled memcached on port 11214 (pretest starts
+  it as `plt-memcached-auth-test`, mounting `test/fixtures/authfile`). Standalone:
+  `docker run -d --rm --name memcached-auth -p 11214:11211 -v "$PWD/test/fixtures:/auth:ro" memcached:alpine memcached -Y /auth/authfile`.
+  The authfile must stay world-readable (644): the container runs as the `memcache` user
+  and memcached exits at startup if it cannot read the file, so the container silently
+  disappears and auth tests fail with connection errors.
 - `test/interop.test.cjs` requires the **built** package (`dist/`), not `src/`; run
   `npm run build` before running it standalone. The other tests import `src/` directly and
   need no build.

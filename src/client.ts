@@ -22,6 +22,9 @@ const KEY_EXPRESSION = /^[\x21-\x7e]{1,250}$/
 // A stats subcommand is a single printable ASCII token
 const STATS_SUBCOMMAND_EXPRESSION = /^[\x21-\x7e]{1,250}$/
 const CAS_EXPRESSION = /^\d+$/
+// The authentication payload is space-delimited and line-terminated, so
+// credentials must be printable ASCII without whitespace or control characters
+const CREDENTIAL_EXPRESSION = /^[\x21-\x7e]+$/
 
 export interface ServerAddress {
   host?: string
@@ -53,7 +56,15 @@ export interface GetsResult {
   cas: string
 }
 
-function parseAddress (url: string | ServerAddress): { host: string, port: number, secure: boolean } {
+interface ParsedAddress {
+  host: string
+  port: number
+  secure: boolean
+  username?: string
+  password?: string
+}
+
+function parseAddress (url: string | ServerAddress): ParsedAddress {
   if (typeof url === 'object' && url !== null) {
     return { host: url.host ?? 'localhost', port: Number(url.port ?? DEFAULT_PORT), secure: false }
   }
@@ -88,7 +99,39 @@ function parseAddress (url: string | ServerAddress): { host: string, port: numbe
     host = host.slice(1, -1)
   }
 
-  return { host, port: parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORT, secure }
+  let username
+  let password
+  if (parsed.username.length > 0 || parsed.password.length > 0) {
+    try {
+      username = decodeURIComponent(parsed.username)
+      password = decodeURIComponent(parsed.password)
+    } catch (cause) {
+      throw new ValidationError(`Invalid credentials in server address: ${url}`, { cause })
+    }
+  }
+
+  return { host, port: parsed.port.length > 0 ? Number(parsed.port) : DEFAULT_PORT, secure, username, password }
+}
+
+function validateCredentials (username: string | undefined, password: string | undefined): { username?: string, password?: string } {
+  if (username === undefined && password === undefined) {
+    return {}
+  }
+
+  if (username === undefined || password === undefined) {
+    throw new ValidationError('The username and password must be provided together')
+  }
+
+  if (
+    typeof username !== 'string' || !CREDENTIAL_EXPRESSION.test(username) ||
+    typeof password !== 'string' || !CREDENTIAL_EXPRESSION.test(password)
+  ) {
+    throw new ValidationError(
+      'Credentials must be non-empty strings of printable ASCII characters and cannot contain whitespace or control characters'
+    )
+  }
+
+  return { username, password }
 }
 
 function validateKey (key: string): void {
@@ -155,11 +198,12 @@ export class Client {
    * Creates a client connected to a single memcached server.
    *
    * @param url `'host:port'`, `'memcached://host:port'`,
-   *            `'memcacheds://host:port'` (TLS) or `{ host, port }`.
+   *            `'memcacheds://host:port'` (TLS),
+   *            `'memcached://user:pass@host:port'` or `{ host, port }`.
    *            Defaults to `localhost:11211`.
    */
   constructor (url: string | ServerAddress = 'localhost:11211', options: ClientOptions = {}) {
-    const { host, port, secure } = parseAddress(url)
+    const { host, port, secure, username, password } = parseAddress(url)
 
     // The memcacheds:// scheme is shorthand for tls: true. An explicit tls
     // options object still applies, so certificates can be configured.
@@ -167,7 +211,13 @@ export class Client {
       options = { ...options, tls: true }
     }
 
-    this.#connection = new Connection(host, port, options)
+    // Explicit options take precedence over credentials embedded in the URL
+    const credentials =
+      options.username !== undefined || options.password !== undefined
+        ? validateCredentials(options.username, options.password)
+        : validateCredentials(username, password)
+
+    this.#connection = new Connection(host, port, { ...options, ...credentials })
   }
 
   // Internal, exposed for tests only

@@ -24,9 +24,9 @@
     "typecheck": "tsc --noEmit",
     "build": "rm -rf dist && tsc -p tsconfig.build.json",
     "prepack": "npm run build",
-    "pretest": "npm run build && (docker run -d --rm --name plt-memcached-test -p 11211:11211 memcached:alpine > /dev/null 2>&1 || true)",
+    "pretest": "npm run build && (docker run -d --rm --name plt-memcached-test -p 11211:11211 memcached:alpine > /dev/null 2>&1 || true) && (docker run -d --rm --name plt-memcached-auth-test -p 11214:11211 -v \"$(pwd)/test/fixtures:/auth:ro\" memcached:alpine memcached -Y /auth/authfile > /dev/null 2>&1 || true)",
     "test": "node --test --test-concurrency=1 test/*.test.ts test/*.test.cjs",
-    "posttest": "docker rm -f plt-memcached-test plt-memcached-tls-test > /dev/null 2>&1 || true",
+    "posttest": "docker rm -f plt-memcached-test plt-memcached-tls-test plt-memcached-auth-test > /dev/null 2>&1 || true",
     "benchmark": "node benchmarks/compare.js"
   },
   "repository": {
