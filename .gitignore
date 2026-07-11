@@ -3,5 +3,4 @@ dist
 *.log
 .DS_Store
 package-lock.json
-pnpm-lock.yaml
-test/fixtures/tls
+packages/memcached/test/fixtures/tls
