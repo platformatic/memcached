@@ -11,6 +11,7 @@ export const TYPE_DELETE = 5
 export const TYPE_ARITH = 6
 export const TYPE_NOOP = 7
 export const TYPE_VERSION = 8
+export const TYPE_STATS = 9
 
 const STATUS_CONNECTING = 0
 const STATUS_READY = 1
@@ -77,6 +78,8 @@ class Pending {
   opaque: string | null
   payload: Payload | null
   sent = false
+  // Accumulator for multi-line responses (classic "stats"), created lazily
+  stats: Record<string, string> | null = null
   resolve!: (value: unknown) => void
   reject!: (error: Error) => void
   next: Pending | null = null
@@ -496,14 +499,8 @@ export class Connection extends EventEmitter {
     }
   }
 
-  #complete (line: string, value: Buffer | null) {
-    const pending = this.#head
-
-    if (pending === null) {
-      this.#socket!.destroy(new ProtocolError(`Received unexpected response: ${line}`))
-      return
-    }
-
+  // Dequeues the head command once its response is complete
+  #dequeue (pending: Pending) {
     this.#head = pending.next
 
     if (this.#head === null) {
@@ -515,6 +512,35 @@ export class Connection extends EventEmitter {
         resolve()
       }
     }
+  }
+
+  #complete (line: string, value: Buffer | null) {
+    const pending = this.#head
+
+    if (pending === null) {
+      this.#socket!.destroy(new ProtocolError(`Received unexpected response: ${line}`))
+      return
+    }
+
+    // Multi-line response: "stats" produces zero or more "STAT <name> <value>"
+    // lines terminated by "END". Accumulate them into the pending command and
+    // keep it at the head of the FIFO until the terminator settles it below.
+    if (pending.type === TYPE_STATS && line.startsWith('STAT ')) {
+      const nameEnd = line.indexOf(' ', 5)
+      const stats = (pending.stats ??= Object.create(null) as Record<string, string>)
+
+      // Values may themselves contain spaces (e.g. in "stats settings"),
+      // so only the first two tokens are split off
+      if (nameEnd === -1) {
+        stats[line.slice(5)] = ''
+      } else {
+        stats[line.slice(5, nameEnd)] = line.slice(nameEnd + 1)
+      }
+
+      return
+    }
+
+    this.#dequeue(pending)
 
     const tokens = line.split(' ')
     const code = tokens[0]
@@ -603,6 +629,15 @@ export class Connection extends EventEmitter {
         break
       case 'VERSION':
         pending.resolve(line.slice(8))
+        break
+      case 'END':
+        if (pending.type === TYPE_STATS) {
+          pending.resolve(pending.stats ?? Object.create(null))
+        } else {
+          const error = new ProtocolError(`Received unexpected response: ${line}`)
+          pending.reject(error)
+          this.#socket!.destroy(error)
+        }
         break
       case 'ERROR':
       case 'CLIENT_ERROR':
