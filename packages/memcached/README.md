@@ -82,8 +82,10 @@ await client.close()
 ### `new Client(servers, options)`
 
 - `servers`: `'host:port'`, `'memcached://host:port'`, `'memcacheds://host:port'` (TLS),
-  `'memcached://user:pass@host:port'`, `{ host, port }` or an array of those for client-side
-  sharding (see [Multiple servers](#multiple-servers-client-side-sharding)). Defaults to
+  `'memcached://user:pass@host:port'`, `{ host, port }`, an array of those for client-side
+  sharding (see [Multiple servers](#multiple-servers-client-side-sharding)), or
+  `{ configEndpoint: 'host:port' }` to discover the server list dynamically (see
+  [ElastiCache Auto Discovery](#elasticache-auto-discovery)). Defaults to
   `'localhost:11211'`.
 - `options.connectTimeout`: milliseconds to wait for the TCP connection (default `5000`).
 - `options.reconnectDelay`: initial reconnection backoff in milliseconds, doubled after each
@@ -105,6 +107,10 @@ await client.close()
 - `options.diagnosticsIncludeKeys`: include the command key in diagnostics channel payloads
   (default `false`, keys may carry sensitive data — see
   [Metrics and diagnostics](#metrics-and-diagnostics)).
+- `options.autoDiscovery`: tune [ElastiCache Auto Discovery](#elasticache-auto-discovery),
+  which is enabled by passing `{ configEndpoint }` as the server address. `true` (the
+  default in that mode) or `{ interval }`, the polling interval in milliseconds
+  (default `60000`).
 
 The constructor connects immediately in the background. Commands issued before the connection
 is established are queued and flushed on connect. On socket errors, all in-flight commands are
@@ -269,6 +275,38 @@ const client = new Client(['cache1:11211', 'cache2:11211', 'cache3:11211'])
 - There is no cross-key atomicity — each key lives on exactly one node. A single hot key
   still pins to one node by construction; sharding spreads aggregate load only.
 
+### ElastiCache Auto Discovery
+
+A static server list requires a config change and a restart in every process whenever the
+cluster grows or shrinks. AWS ElastiCache (memcached engine) instead exposes a
+**configuration endpoint** that every client can poll for the current node list
+(`config get cluster`). Pass it as the server address to track membership dynamically:
+
+```js
+const client = new Client(
+  { configEndpoint: 'mycluster.cfg.use1.cache.amazonaws.com:11211' },
+  { autoDiscovery: { interval: 60_000 } } // optional, 60s is the default
+)
+```
+
+- The client seeds the ring from the endpoint's first response and re-polls on the
+  interval. Commands issued before the first topology arrives are queued and routed once
+  discovery resolves (they reject with `ConnectionError` if the client is closed first).
+- On membership change the ketama ring is rebuilt — only ~1/N of the keyspace remaps by
+  construction. New nodes get `poolSize` connections; connections to removed nodes drain
+  their in-flight commands and close in the background. Surviving nodes keep their
+  connections, backoff state and pipelines untouched.
+- Configurations carry a version number; only strictly newer versions are applied, so a
+  stale or replayed response can never roll the topology back.
+- **Fail-safe**: if the endpoint is unreachable or returns a malformed response, the last
+  known topology stays in place and polling continues.
+- `close()` stops the polling loop and closes the configuration connection along with all
+  node connections. TLS and credentials options apply to the configuration endpoint and to
+  every discovered node alike.
+- Requires ElastiCache with memcached >= 1.4.14 (the modern `config get cluster` form; the
+  legacy key-based variant is not supported). The static array form remains the default —
+  auto discovery is purely opt-in.
+
 ## TTLs
 
 TTLs are expressed in **seconds** — that is the granularity memcached supports. `0` (the
@@ -361,7 +399,8 @@ the client already executes, so it is always on.
       mn: { issued: 0, completed: 0, failed: 0 },
       version: { issued: 0, completed: 0, failed: 0 },
       stats: { issued: 0, completed: 0, failed: 0 },
-      auth: { issued: 0, completed: 0, failed: 0 }
+      auth: { issued: 0, completed: 0, failed: 0 },
+      config: { issued: 0, completed: 0, failed: 0 }
     }
   },
   pipeline: {
@@ -511,11 +550,6 @@ pnpm test
 Tests are TypeScript executed directly by `node --test` through type stripping, so
 development requires Node.js >= 22.18.0 (or any 23.6+/24+); consuming the published
 package does not.
-
-## Roadmap
-
-- ElastiCache Auto Discovery (`config get cluster`) for dynamic node lists
-  ([#21](https://github.com/platformatic/memcached/issues/21)).
 
 ## License
 

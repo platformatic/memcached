@@ -3,6 +3,7 @@ import {
   TYPE_ADD,
   TYPE_ARITH,
   TYPE_CAS,
+  TYPE_CONFIG,
   TYPE_DELETE,
   TYPE_GET,
   TYPE_GETS,
@@ -14,13 +15,18 @@ import {
   TYPE_VERSION,
   type CachedumpItem,
   type ClientMetrics,
-  type ClientOptions
+  type ClientOptions,
+  type ClusterConfig
 } from './connection.ts'
-import { ValidationError } from './errors.ts'
-import { HashRing } from './ring.ts'
+import { ConnectionError, ValidationError } from './errors.ts'
+import { HashRing, type RingNode } from './ring.ts'
 
 const DEFAULT_PORT = 11211
+const DEFAULT_DISCOVERY_INTERVAL = 60_000
 const CRLF = '\r\n'
+
+// Swallows errors of fire-and-forget teardowns (closing removed nodes)
+function ignore () {}
 
 // Printable ASCII, no whitespace or control characters, at most 250 bytes
 const KEY_EXPRESSION = /^[\x21-\x7e]{1,250}$/
@@ -34,6 +40,15 @@ const CREDENTIAL_EXPRESSION = /^[\x21-\x7e]+$/
 export interface ServerAddress {
   host?: string
   port?: number
+}
+
+export interface ConfigEndpointAddress {
+  /**
+   * ElastiCache configuration endpoint (`'host:port'`), polled with
+   * `config get cluster` to discover cluster membership dynamically (Auto
+   * Discovery). Mutually exclusive with `host`/`port` and with server arrays.
+   */
+  configEndpoint: string
 }
 
 export interface StoreOptions {
@@ -238,26 +253,74 @@ export class Client {
   #poolSize: number
   #ring: HashRing | null
   #opaque = 0
+  #closed = false
+
+  // Auto discovery state, unused in static mode. The #ready gate parks
+  // commands issued before the first topology arrives: they are routed once
+  // the initial `config get cluster` response is applied.
+  #configConnection: Connection | null = null
+  #nodeOptions: ClientOptions | null = null
+  #discoveryInterval = 0
+  #pollTimer: NodeJS.Timeout | undefined = undefined
+  #configVersion = -1
+  #nodes: RingNode[] = []
+  #ready: Promise<void> | null = null
+  #readyResolve: (() => void) | null = null
+  #readyReject: ((error: Error) => void) | null = null
 
   /**
-   * Creates a client. Pass a single address to talk to one server, or an
-   * array of addresses to shard keys across several servers with
-   * ketama-style consistent hashing (see the README for the routing and
-   * failure semantics).
+   * Creates a client. Pass a single address to talk to one server, an array
+   * of addresses to shard keys across several servers with ketama-style
+   * consistent hashing, or `{ configEndpoint }` to discover the server list
+   * dynamically from an ElastiCache configuration endpoint (see the README
+   * for the routing and failure semantics).
    *
    * @param servers `'host:port'`, `'memcached://host:port'`,
    *                `'memcacheds://host:port'` (TLS),
-   *                `'memcached://user:pass@host:port'`, `{ host, port }`
-   *                or an array of those. Defaults to `localhost:11211`.
+   *                `'memcached://user:pass@host:port'`, `{ host, port }`,
+   *                an array of those, or `{ configEndpoint: 'host:port' }`.
+   *                Defaults to `localhost:11211`.
    */
-  constructor (servers: string | ServerAddress | Array<string | ServerAddress> = 'localhost:11211', options: ClientOptions = {}) {
+  constructor (
+    servers: string | ServerAddress | ConfigEndpointAddress | Array<string | ServerAddress> = 'localhost:11211',
+    options: ClientOptions = {}
+  ) {
     const list = Array.isArray(servers) ? servers : [servers]
 
     if (list.length === 0) {
       throw new ValidationError('At least one server address must be provided')
     }
 
-    const addresses = list.map(parseAddress)
+    const poolSize = options.poolSize ?? 1
+    if (!Number.isSafeInteger(poolSize) || poolSize < 1) {
+      throw new ValidationError('The poolSize option must be a positive integer')
+    }
+
+    this.#poolSize = poolSize
+    this.#connections = []
+    this.#ring = null
+
+    for (const server of list) {
+      if (typeof server === 'object' && server !== null && (server as ConfigEndpointAddress).configEndpoint !== undefined) {
+        if (Array.isArray(servers)) {
+          throw new ValidationError('A configuration endpoint cannot be part of a server array')
+        }
+
+        if ((server as ServerAddress).host !== undefined || (server as ServerAddress).port !== undefined) {
+          throw new ValidationError('The configEndpoint property is mutually exclusive with host and port')
+        }
+
+        this.#setupDiscovery((server as ConfigEndpointAddress).configEndpoint, options)
+        return
+      }
+    }
+
+    if (options.autoDiscovery !== undefined && options.autoDiscovery !== false) {
+      throw new ValidationError('The autoDiscovery option requires a configEndpoint server address')
+    }
+
+    // Config endpoints returned above, so only plain addresses are left
+    const addresses = (list as Array<string | ServerAddress>).map(parseAddress)
     const seen = new Set<string>()
 
     for (const { host, port } of addresses) {
@@ -269,14 +332,6 @@ export class Client {
 
       seen.add(id)
     }
-
-    const poolSize = options.poolSize ?? 1
-    if (!Number.isSafeInteger(poolSize) || poolSize < 1) {
-      throw new ValidationError('The poolSize option must be a positive integer')
-    }
-
-    this.#poolSize = poolSize
-    this.#connections = []
 
     for (const { host, port, secure, username, password } of addresses) {
       let connectionOptions = options
@@ -302,6 +357,153 @@ export class Client {
     this.#ring = addresses.length > 1 ? new HashRing(addresses) : null
   }
 
+  // Validates the auto discovery configuration, opens the connection to the
+  // configuration endpoint and starts the polling loop. The node list starts
+  // empty: the #ready gate holds commands until the first topology arrives.
+  #setupDiscovery (endpoint: string, options: ClientOptions): void {
+    if (typeof endpoint !== 'string' || endpoint.length === 0) {
+      throw new ValidationError('The configEndpoint must be a non-empty string')
+    }
+
+    const autoDiscovery = options.autoDiscovery ?? true
+
+    if (autoDiscovery === false) {
+      throw new ValidationError('The autoDiscovery option cannot be disabled when a configEndpoint is used')
+    }
+
+    let interval = DEFAULT_DISCOVERY_INTERVAL
+
+    if (autoDiscovery !== true) {
+      if (typeof autoDiscovery !== 'object' || autoDiscovery === null) {
+        throw new ValidationError('The autoDiscovery option must be a boolean or an object')
+      }
+
+      if (autoDiscovery.interval !== undefined) {
+        if (!Number.isSafeInteger(autoDiscovery.interval) || autoDiscovery.interval < 1) {
+          throw new ValidationError('The autoDiscovery interval must be a positive integer number of milliseconds')
+        }
+
+        interval = autoDiscovery.interval
+      }
+    }
+
+    const { host, port, secure, username, password } = parseAddress(endpoint)
+
+    let connectionOptions = options
+    if (secure && (typeof connectionOptions.tls !== 'object' || connectionOptions.tls === null)) {
+      connectionOptions = { ...connectionOptions, tls: true }
+    }
+
+    const credentials =
+      options.username !== undefined || options.password !== undefined
+        ? validateCredentials(options.username, options.password)
+        : validateCredentials(username, password)
+
+    this.#discoveryInterval = interval
+    // Discovered nodes inherit the client options (TLS, credentials, ...)
+    this.#nodeOptions = { ...connectionOptions, ...credentials }
+    this.#configConnection = new Connection(host, port, this.#nodeOptions)
+
+    const ready = new Promise<void>((resolve, reject) => {
+      this.#readyResolve = resolve
+      this.#readyReject = reject
+    })
+    // close() rejects the gate even when no command is parked on it
+    ready.catch(ignore)
+    this.#ready = ready
+
+    this.#poll()
+  }
+
+  // One polling round: fetch the configuration and apply it, then schedule
+  // the next round. If the endpoint is unreachable or the response is
+  // malformed the last known topology is kept and polling continues. The
+  // timer is deliberately not unref'd: an open client keeps the process
+  // alive until close(), consistently with the reconnection timers.
+  async #poll (): Promise<void> {
+    try {
+      const config = await this.#configConnection!.execute<ClusterConfig>(TYPE_CONFIG, `config get cluster${CRLF}`)
+      this.#applyConfig(config)
+    } catch {
+      // Fail-safe: keep the last known topology and keep polling
+    }
+
+    if (!this.#closed) {
+      this.#pollTimer = setTimeout(() => {
+        this.#poll()
+      }, this.#discoveryInterval)
+    }
+  }
+
+  // Swaps the topology: rebuilds the ring, opens connections to added nodes
+  // and drains/closes connections to removed ones (fire and forget, so the
+  // poll loop is never blocked). Only strictly newer versions are applied —
+  // a stale or replayed configuration is ignored.
+  #applyConfig (config: ClusterConfig): void {
+    if (this.#closed || config.version <= this.#configVersion || config.nodes.length === 0) {
+      return
+    }
+
+    // Defensively drop duplicate host:port entries
+    const nodes: RingNode[] = []
+    const ids = new Set<string>()
+
+    for (const { host, port } of config.nodes) {
+      const id = `${host}:${port}`
+
+      if (!ids.has(id)) {
+        ids.add(id)
+        nodes.push({ host, port })
+      }
+    }
+
+    this.#configVersion = config.version
+
+    // Index the current pools by node so surviving nodes keep their
+    // connections (and their queued commands, backoff state and sockets)
+    const pools = new Map<string, Connection[]>()
+    for (let i = 0; i < this.#nodes.length; i++) {
+      const { host, port } = this.#nodes[i]
+      pools.set(`${host}:${port}`, this.#connections.slice(i * this.#poolSize, (i + 1) * this.#poolSize))
+    }
+
+    const connections: Connection[] = []
+    for (const { host, port } of nodes) {
+      const id = `${host}:${port}`
+      const existing = pools.get(id)
+
+      if (existing !== undefined) {
+        pools.delete(id)
+        connections.push(...existing)
+      } else {
+        for (let i = 0; i < this.#poolSize; i++) {
+          connections.push(new Connection(host, port, this.#nodeOptions!))
+        }
+      }
+    }
+
+    // What is left in the index belongs to removed nodes: close() drains
+    // their in-flight commands before tearing the sockets down
+    for (const removed of pools.values()) {
+      for (const connection of removed) {
+        connection.close().catch(ignore)
+      }
+    }
+
+    this.#nodes = nodes
+    this.#connections = connections
+    this.#ring = nodes.length > 1 ? new HashRing(nodes) : null
+
+    // First topology: release commands parked before discovery completed
+    if (this.#readyResolve !== null) {
+      const resolve = this.#readyResolve
+      this.#readyResolve = null
+      this.#readyReject = null
+      this.#ready = null
+      resolve()
+    }
+  }
+
   // Internal, exposed for tests only
   get connection (): Connection {
     return this.#connections[0]
@@ -318,7 +520,7 @@ export class Client {
   get (key: string): Promise<Buffer | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque, key)
+    return this.#execute(TYPE_GET, `mg ${key} v O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -327,7 +529,7 @@ export class Client {
   gets (key: string): Promise<GetsResult | null> {
     validateKey(key)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque, key)
+    return this.#execute(TYPE_GETS, `mg ${key} v c O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -361,7 +563,7 @@ export class Client {
     validateKey(key)
     const cas = options?.cas !== undefined ? ` C${validateCas(options.cas)}` : ''
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque, key)
+    return this.#execute(TYPE_DELETE, `md ${key}${cas} O${opaque}${CRLF}`, opaque, key)
   }
 
   /**
@@ -385,6 +587,10 @@ export class Client {
    * pipeline fence.
    */
   async noop (): Promise<void> {
+    if (this.#ready !== null) {
+      await this.#ready
+    }
+
     await Promise.all(this.#connections.map(connection => connection.execute<void>(TYPE_NOOP, `mn${CRLF}`)))
   }
 
@@ -394,6 +600,10 @@ export class Client {
    * makes this reject) and the first server's version is returned.
    */
   async version (): Promise<string> {
+    if (this.#ready !== null) {
+      await this.#ready
+    }
+
     const versions = await Promise.all(
       this.#connections.map(connection => connection.execute<string>(TYPE_VERSION, `version${CRLF}`))
     )
@@ -417,6 +627,10 @@ export class Client {
       connection.collectMetrics(snapshot)
     }
 
+    if (this.#configConnection !== null) {
+      this.#configConnection.collectMetrics(snapshot)
+    }
+
     return snapshot
   }
 
@@ -431,7 +645,13 @@ export class Client {
    * server's stats are returned; use statsAll() for per-node visibility.
    */
   stats (subcommand?: string): Promise<Record<string, string>> {
-    return this.#connections[0].execute(TYPE_STATS, statsCommand(subcommand))
+    const payload = statsCommand(subcommand)
+
+    if (this.#ready !== null) {
+      return this.#ready.then(() => this.#connections[0].execute<Record<string, string>>(TYPE_STATS, payload))
+    }
+
+    return this.#connections[0].execute(TYPE_STATS, payload)
   }
 
   /**
@@ -446,6 +666,15 @@ export class Client {
    */
   statsAll (subcommand?: string): Promise<ServerStats[]> {
     const payload = statsCommand(subcommand)
+
+    if (this.#ready !== null) {
+      return this.#ready.then(() => this.#statsAll(payload))
+    }
+
+    return this.#statsAll(payload)
+  }
+
+  #statsAll (payload: string): Promise<ServerStats[]> {
     const nodes = this.#connections.length / this.#poolSize
     const queries: Array<Promise<ServerStats>> = []
 
@@ -471,6 +700,10 @@ export class Client {
    * servers, only the first server is reset.
    */
   resetStats (): Promise<void> {
+    if (this.#ready !== null) {
+      return this.#ready.then(() => this.#connections[0].execute<void>(TYPE_STATS_RESET, `stats reset${CRLF}`))
+    }
+
     return this.#connections[0].execute(TYPE_STATS_RESET, `stats reset${CRLF}`)
   }
 
@@ -498,14 +731,44 @@ export class Client {
       throw new ValidationError('The limit must be a non-negative integer')
     }
 
-    return this.#connections[0].execute(TYPE_CACHEDUMP, `stats cachedump ${slab} ${limit}${CRLF}`)
+    const payload = `stats cachedump ${slab} ${limit}${CRLF}`
+
+    if (this.#ready !== null) {
+      return this.#ready.then(() => this.#connections[0].execute<CachedumpItem[]>(TYPE_CACHEDUMP, payload))
+    }
+
+    return this.#connections[0].execute(TYPE_CACHEDUMP, payload)
   }
 
   /**
    * Waits for in-flight commands to settle, then closes all connections.
+   * With auto discovery this also stops the polling loop and closes the
+   * configuration endpoint connection.
    */
   async close (): Promise<void> {
-    await Promise.all(this.#connections.map(connection => connection.close()))
+    this.#closed = true
+
+    if (this.#pollTimer !== undefined) {
+      clearTimeout(this.#pollTimer)
+      this.#pollTimer = undefined
+    }
+
+    // Commands parked before the first topology arrived can never be routed.
+    // The gate stays in place rejected, so later commands reject as well.
+    if (this.#readyReject !== null) {
+      const reject = this.#readyReject
+      this.#readyResolve = null
+      this.#readyReject = null
+      reject(new ConnectionError('Connection is closed'))
+    }
+
+    const closing = this.#connections.map(connection => connection.close())
+
+    if (this.#configConnection !== null) {
+      closing.push(this.#configConnection.close())
+    }
+
+    await Promise.all(closing)
   }
 
   #store<T> (type: number, extra: string, key: string, value: Buffer | string, options?: StoreOptions): Promise<T> {
@@ -522,14 +785,26 @@ export class Client {
     payload[payload.length - 2] = 13
     payload[payload.length - 1] = 10
 
-    return this.#connectionFor(key).execute(type, payload, opaque, key)
+    return this.#execute(type, payload, opaque, key)
   }
 
   #arithmetic (mode: 'I' | 'D', key: string, delta: number | bigint): Promise<bigint | null> {
     validateKey(key)
     const encoded = validateDelta(delta)
     const opaque = this.#nextOpaque()
-    return this.#connectionFor(key).execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque, key)
+    return this.#execute(TYPE_ARITH, `ma ${key} v M${mode} D${encoded} O${opaque}${CRLF}`, opaque, key)
+  }
+
+  // Routes a key-addressed command to its connection. With auto discovery,
+  // commands issued before the first topology arrives (or after close() when
+  // discovery never completed) chain on the #ready gate and are routed - or
+  // rejected - once it settles.
+  #execute<T> (type: number, payload: string | Buffer, opaque: string, key: string): Promise<T> {
+    if (this.#ready !== null) {
+      return this.#ready.then(() => this.#connectionFor(key).execute<T>(type, payload, opaque, key))
+    }
+
+    return this.#connectionFor(key).execute<T>(type, payload, opaque, key)
   }
 
   // Key to node routing: a single server bypasses hashing entirely. Within a

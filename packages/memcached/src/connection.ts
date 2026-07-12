@@ -17,11 +17,12 @@ export const TYPE_STATS = 9
 export const TYPE_AUTH = 10
 export const TYPE_STATS_RESET = 11
 export const TYPE_CACHEDUMP = 12
+export const TYPE_CONFIG = 13
 
 // Wire verb labels indexed by command type, used for metrics and diagnostics.
 // "stats reset" and "stats cachedump" share the "stats" wire verb, like the
 // meta commands sharing "mg"/"ms".
-const VERBS = ['mg', 'mg', 'ms', 'ms', 'ms', 'md', 'ma', 'mn', 'version', 'stats', 'auth', 'stats', 'stats']
+const VERBS = ['mg', 'mg', 'ms', 'ms', 'ms', 'md', 'ma', 'mn', 'version', 'stats', 'auth', 'stats', 'stats', 'config']
 
 // "stats cachedump" item line: ITEM <key> [<size> b; <exptime> s]. Keys are
 // printable ASCII without whitespace, so \S is enough for the key token.
@@ -217,9 +218,76 @@ export interface ClientOptions {
    * @default false
    */
   diagnosticsIncludeKeys?: boolean
+
+  /**
+   * Tune ElastiCache Auto Discovery, which is enabled by constructing the
+   * client with `{ configEndpoint: 'host:port' }`. Pass `true` (or leave it
+   * unset) for the defaults, or an object to set the polling interval.
+   * Ignored by anything but the Client constructor; cannot be `false` when a
+   * configuration endpoint is used and cannot be enabled without one.
+   */
+  autoDiscovery?: boolean | AutoDiscoveryOptions
+}
+
+export interface AutoDiscoveryOptions {
+  /**
+   * Milliseconds between `config get cluster` polls of the configuration
+   * endpoint.
+   * @default 60000
+   */
+  interval?: number
 }
 
 type Payload = string | Buffer
+
+/**
+ * A cluster node advertised by an ElastiCache configuration endpoint.
+ */
+export interface ClusterConfigNode {
+  host: string
+  port: number
+}
+
+/**
+ * Parsed `config get cluster` response (ElastiCache Auto Discovery).
+ */
+export interface ClusterConfig {
+  /** Monotonically increasing configuration version number. */
+  version: number
+  nodes: ClusterConfigNode[]
+}
+
+// Parses the `config get cluster` data block: a version number on the first
+// line, then space-separated `hostname|ip|port` triples on the second. The ip
+// may be empty (DNS-based configs); it is preferred over the hostname when
+// present. Throws ProtocolError on malformed data.
+export function parseClusterConfig (data: Buffer): ClusterConfig {
+  const lines = data.toString('latin1').split('\n')
+  const version = Number.parseInt(lines[0].trim(), 10)
+
+  if (!Number.isSafeInteger(version) || version < 0 || lines.length < 2) {
+    throw new ProtocolError(`Malformed cluster configuration: ${data.toString('latin1')}`)
+  }
+
+  const nodes: ClusterConfigNode[] = []
+  const list = lines[1].trim()
+
+  if (list.length > 0) {
+    for (const triple of list.split(/\s+/)) {
+      const [hostname, ip, portToken] = triple.split('|')
+      const port = Number.parseInt(portToken!, 10)
+      const host = ip !== undefined && ip.length > 0 ? ip : hostname
+
+      if (host === undefined || host.length === 0 || !Number.isSafeInteger(port) || port < 1 || port > 65535) {
+        throw new ProtocolError(`Malformed cluster configuration node: ${triple}`)
+      }
+
+      nodes.push({ host, port })
+    }
+  }
+
+  return { version, nodes }
+}
 
 // Settlement callbacks for the internal authentication command: nobody awaits
 // it, success is silent and failure is propagated by rejecting user commands.
@@ -237,6 +305,8 @@ class Pending {
   stats: Record<string, string> | null = null
   // Accumulator for "stats cachedump" ITEM lines, created lazily
   items: CachedumpItem[] | null = null
+  // Data block of a "config get cluster" response, held until END settles it
+  config: Buffer | null = null
   resolve!: (value: unknown) => void
   reject!: (error: Error) => void
   next: Pending | null = null
@@ -857,6 +927,19 @@ export class Connection extends EventEmitter {
           this.#state = STATE_VALUE
           this.#valueLine = line
           this.#valueNeeded = size
+        } else if (line.startsWith('CONFIG ')) {
+          // "CONFIG <key> <flags> <size>" - classic VALUE-style line answered
+          // to "config get cluster", a length-prefixed data block follows
+          const size = Number.parseInt(line.slice(line.lastIndexOf(' ') + 1), 10)
+
+          if (!Number.isSafeInteger(size) || size < 0) {
+            socket.destroy(new ProtocolError(`Malformed value size in response: ${line}`))
+            return
+          }
+
+          this.#state = STATE_VALUE
+          this.#valueLine = line
+          this.#valueNeeded = size
         } else {
           this.#complete(line, null)
         }
@@ -959,6 +1042,21 @@ export class Connection extends EventEmitter {
       })
 
       return
+    }
+
+    // Multi-line response: "config get cluster" produces a "CONFIG" line with
+    // a data block, an optional blank line, then "END". Hold the data block on
+    // the pending command until the terminator settles it below.
+    if (pending.type === TYPE_CONFIG) {
+      if (line.startsWith('CONFIG ')) {
+        pending.config = value
+        return
+      }
+
+      if (line.length === 0) {
+        // ElastiCache sends an extra \r\n between the data block and END
+        return
+      }
     }
 
     this.#dequeue(pending)
@@ -1071,6 +1169,21 @@ export class Connection extends EventEmitter {
           this.#settleResolve(pending, pending.stats ?? Object.create(null))
         } else if (pending.type === TYPE_CACHEDUMP) {
           this.#settleResolve(pending, pending.items ?? [])
+        } else if (pending.type === TYPE_CONFIG) {
+          // A malformed configuration rejects the command but keeps the
+          // connection: the stream is still in sync, only the payload is bad
+          if (pending.config === null) {
+            this.#settleReject(pending, new ProtocolError('Missing cluster configuration in response'))
+          } else {
+            let config
+            try {
+              config = parseClusterConfig(pending.config)
+            } catch (error) {
+              this.#settleReject(pending, error as Error)
+              break
+            }
+            this.#settleResolve(pending, config)
+          }
         } else {
           const error = new ProtocolError(`Received unexpected response: ${line}`)
           this.#settleReject(pending, error)

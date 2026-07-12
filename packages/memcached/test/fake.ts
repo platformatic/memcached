@@ -35,6 +35,13 @@ export class FakeMemcached {
   // Total sockets ever accepted, to observe pool sizes
   connections = 0
   port = 0
+  // Cluster configuration served for "config get cluster" (ElastiCache Auto
+  // Discovery): a version number and "hostname|ip|port" triples. Assign both
+  // to make this fake act as a configuration endpoint; configGets counts the
+  // polls received. A non-integer version produces a malformed data block.
+  configVersion: number | string = 0
+  configNodes: string[] = []
+  configGets = 0
 
   #server: Server
   #sockets = new Set<Socket>()
@@ -155,6 +162,13 @@ export class FakeMemcached {
           chunks.push(`END${CRLF}`)
           reply(0, chunks)
         }
+      } else if (command === 'config') {
+        // "config get cluster": classic VALUE-style line with a data block of
+        // version + node triples, an extra blank line, then END - the exact
+        // shape documented for ElastiCache Auto Discovery
+        this.configGets++
+        const data = `${this.configVersion}\n${this.configNodes.join(' ')}\n`
+        reply(0, [`CONFIG cluster 0 ${data.length}${CRLF}`, data, CRLF, CRLF, `END${CRLF}`])
       } else {
         reply(0, [`ERROR${CRLF}`])
       }
