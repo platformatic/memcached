@@ -6,10 +6,13 @@ import {
   TYPE_DELETE,
   TYPE_GET,
   TYPE_GETS,
+  TYPE_CACHEDUMP,
   TYPE_NOOP,
   TYPE_SET,
   TYPE_STATS,
+  TYPE_STATS_RESET,
   TYPE_VERSION,
+  type CachedumpItem,
   type ClientMetrics,
   type ClientOptions
 } from './connection.ts'
@@ -190,6 +193,16 @@ function statsCommand (subcommand: string | undefined): string {
     throw new ValidationError(
       'The stats subcommand must be a non-empty string of at most 250 printable ASCII characters and cannot contain whitespace or control characters'
     )
+  }
+
+  // These two subcommands do not answer with STAT lines and an END
+  // terminator, so they need the dedicated methods to parse correctly
+  if (subcommand === 'reset') {
+    throw new ValidationError("The 'reset' stats subcommand is not END-terminated: use resetStats() instead")
+  }
+
+  if (subcommand === 'cachedump') {
+    throw new ValidationError("The 'cachedump' stats subcommand is not END-terminated: use cachedump(slab, limit) instead")
   }
 
   return `stats ${subcommand}${CRLF}`
@@ -413,8 +426,9 @@ export class Client {
    *
    * An optional subcommand selects a specific domain, e.g. `'items'`,
    * `'slabs'` or `'settings'`. Only `END`-terminated subcommands are
-   * supported. With multiple servers, the first server's stats are returned;
-   * use statsAll() for per-node visibility.
+   * supported: use `resetStats()` and `cachedump()` for the two subcommands
+   * with a different response shape. With multiple servers, the first
+   * server's stats are returned; use statsAll() for per-node visibility.
    */
   stats (subcommand?: string): Promise<Record<string, string>> {
     return this.#connections[0].execute(TYPE_STATS, statsCommand(subcommand))
@@ -448,6 +462,43 @@ export class Client {
     }
 
     return Promise.all(queries)
+  }
+
+  /**
+   * Resets the server statistics counters (`stats reset`): `get_hits`,
+   * `get_misses`, `cmd_get`, eviction counters and so on go back to zero.
+   * Gauges like `curr_connections` or `bytes` are unaffected. With multiple
+   * servers, only the first server is reset.
+   */
+  resetStats (): Promise<void> {
+    return this.#connections[0].execute(TYPE_STATS_RESET, `stats reset${CRLF}`)
+  }
+
+  /**
+   * Dumps the keys stored in a slab class (`stats cachedump`), returning
+   * for each item its key, value size in bytes and expiration time as an
+   * absolute Unix timestamp (0 when the item never expires). `limit` caps
+   * the number of returned items; 0 (the default) means no limit. Slab class
+   * ids can be discovered via `stats('items')` or `stats('slabs')`.
+   *
+   * Caveats: `cachedump` is an unofficial debugging command that may change
+   * or disappear in any memcached release. The dump is capped server-side
+   * (about 2MB of response data), so it is not guaranteed to list every key,
+   * and newly stored items may not appear until the LRU maintainer has
+   * processed them. On old servers it holds the cache lock while dumping, so
+   * do not use it against busy production servers. With multiple servers,
+   * only the first server is dumped.
+   */
+  cachedump (slab: number, limit: number = 0): Promise<CachedumpItem[]> {
+    if (!Number.isSafeInteger(slab) || slab < 1) {
+      throw new ValidationError('The slab class id must be a positive integer')
+    }
+
+    if (!Number.isSafeInteger(limit) || limit < 0) {
+      throw new ValidationError('The limit must be a non-negative integer')
+    }
+
+    return this.#connections[0].execute(TYPE_CACHEDUMP, `stats cachedump ${slab} ${limit}${CRLF}`)
   }
 
   /**

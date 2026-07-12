@@ -162,8 +162,9 @@ version is returned.
 Returns server statistics as a name/value map, useful for observability: connection counts,
 evictions, `get_hits`/`get_misses`, memory usage and so on. An optional subcommand selects a
 specific domain, e.g. `stats('items')`, `stats('slabs')` or `stats('settings')`. Only
-`END`-terminated subcommands are supported (notably not `reset` or `cachedump`). With
-multiple servers, the first server's stats are returned; use
+`END`-terminated subcommands are supported: `stats('reset')` and `stats('cachedump')`
+throw a `ValidationError` pointing to the dedicated methods below. With multiple servers,
+the first server's stats are returned; use
 [`statsAll()`](#clientstatsallsubcommand--promiseserverstats) for per-node visibility.
 
 ### `client.statsAll([subcommand])` → `Promise<ServerStats[]>`
@@ -175,6 +176,26 @@ and `error` carries the reason. The promise never rejects because of a node fail
 dashboard keeps seeing the healthy part of the fleet — check each entry's `error` field
 instead. Takes the same optional subcommand as `stats()`, with the same validation
 (`ValidationError` is thrown synchronously).
+
+### `client.resetStats()` → `Promise<void>`
+
+Resets the server statistics counters (`stats reset`): `get_hits`, `get_misses`,
+`cmd_get`, eviction counters and so on go back to zero. Gauges like `curr_connections` or
+`bytes` are unaffected. With multiple servers, only the first server is reset.
+
+### `client.cachedump(slab, [limit])` → `Promise<Array<{ key, size, exptime }>>`
+
+Dumps the keys stored in a slab class (`stats cachedump`), returning for each item its
+key, value `size` in bytes and `exptime` as an absolute Unix timestamp (0 when the item
+never expires). `limit` caps the number of returned items; 0 (the default) means no
+limit. Slab class ids can be discovered via `stats('items')` or `stats('slabs')`.
+
+> **Warning**: `cachedump` is an unofficial debugging command that may change or
+> disappear in any memcached release. The dump is capped server-side (about 2MB of
+> response data), so it is not guaranteed to list every key, and newly stored items may
+> not appear until the LRU maintainer has processed them (typically within a second). On
+> old servers it holds the cache lock while dumping — do not use it against busy
+> production servers. With multiple servers, only the first server is dumped.
 
 ### `client.metrics()` → `ClientMetrics`
 

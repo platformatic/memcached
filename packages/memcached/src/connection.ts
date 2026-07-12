@@ -15,9 +15,17 @@ export const TYPE_NOOP = 7
 export const TYPE_VERSION = 8
 export const TYPE_STATS = 9
 export const TYPE_AUTH = 10
+export const TYPE_STATS_RESET = 11
+export const TYPE_CACHEDUMP = 12
 
-// Wire verb labels indexed by command type, used for metrics and diagnostics
-const VERBS = ['mg', 'mg', 'ms', 'ms', 'ms', 'md', 'ma', 'mn', 'version', 'stats', 'auth']
+// Wire verb labels indexed by command type, used for metrics and diagnostics.
+// "stats reset" and "stats cachedump" share the "stats" wire verb, like the
+// meta commands sharing "mg"/"ms".
+const VERBS = ['mg', 'mg', 'ms', 'ms', 'ms', 'md', 'ma', 'mn', 'version', 'stats', 'auth', 'stats', 'stats']
+
+// "stats cachedump" item line: ITEM <key> [<size> b; <exptime> s]. Keys are
+// printable ASCII without whitespace, so \S is enough for the key token.
+const CACHEDUMP_ITEM_EXPRESSION = /^ITEM (\S+) \[(\d+) b; (\d+) s\]$/
 
 const STATUS_CONNECTING = 0
 const STATUS_READY = 1
@@ -74,6 +82,20 @@ export interface ConnectionDiagnosticsEvent {
   attempt?: number
   /** reconnect only: backoff delay before the attempt, in milliseconds. */
   delayMs?: number
+}
+
+/**
+ * One entry of a `stats cachedump` response.
+ */
+export interface CachedumpItem {
+  key: string
+  /** Size of the stored value in bytes. */
+  size: number
+  /**
+   * Expiration time as an absolute Unix timestamp in seconds, or 0 when the
+   * item never expires.
+   */
+  exptime: number
 }
 
 export interface VerbMetrics {
@@ -213,6 +235,8 @@ class Pending {
   sent = false
   // Accumulator for multi-line responses (classic "stats"), created lazily
   stats: Record<string, string> | null = null
+  // Accumulator for "stats cachedump" ITEM lines, created lazily
+  items: CachedumpItem[] | null = null
   resolve!: (value: unknown) => void
   reject!: (error: Error) => void
   next: Pending | null = null
@@ -914,6 +938,29 @@ export class Connection extends EventEmitter {
       return
     }
 
+    // Multi-line response: "stats cachedump" produces zero or more
+    // "ITEM <key> [<size> b; <exptime> s]" lines terminated by "END".
+    if (pending.type === TYPE_CACHEDUMP && line.startsWith('ITEM ')) {
+      const item = CACHEDUMP_ITEM_EXPRESSION.exec(line)
+
+      if (item === null) {
+        const error = new ProtocolError(`Malformed cachedump item: ${line}`)
+        this.#dequeue(pending)
+        this.#settleReject(pending, error)
+        this.#socket!.destroy(error)
+        return
+      }
+
+      const items = (pending.items ??= [])
+      items.push({
+        key: item[1],
+        size: Number.parseInt(item[2], 10),
+        exptime: Number.parseInt(item[3], 10)
+      })
+
+      return
+    }
+
     this.#dequeue(pending)
 
     const tokens = line.split(' ')
@@ -1021,10 +1068,21 @@ export class Connection extends EventEmitter {
         break
       case 'END':
         if (pending.type === TYPE_STATS) {
-          pending.resolve(pending.stats ?? Object.create(null))
+          this.#settleResolve(pending, pending.stats ?? Object.create(null))
+        } else if (pending.type === TYPE_CACHEDUMP) {
+          this.#settleResolve(pending, pending.items ?? [])
         } else {
           const error = new ProtocolError(`Received unexpected response: ${line}`)
-          pending.reject(error)
+          this.#settleReject(pending, error)
+          this.#socket!.destroy(error)
+        }
+        break
+      case 'RESET':
+        if (pending.type === TYPE_STATS_RESET) {
+          this.#settleResolve(pending, undefined)
+        } else {
+          const error = new ProtocolError(`Received unexpected response: ${line}`)
+          this.#settleReject(pending, error)
           this.#socket!.destroy(error)
         }
         break
