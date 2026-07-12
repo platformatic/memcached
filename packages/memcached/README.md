@@ -163,8 +163,18 @@ Returns server statistics as a name/value map, useful for observability: connect
 evictions, `get_hits`/`get_misses`, memory usage and so on. An optional subcommand selects a
 specific domain, e.g. `stats('items')`, `stats('slabs')` or `stats('settings')`. Only
 `END`-terminated subcommands are supported (notably not `reset` or `cachedump`). With
-multiple servers, the first server's stats are returned; per-node visibility needs a
-client per node.
+multiple servers, the first server's stats are returned; use
+[`statsAll()`](#clientstatsallsubcommand--promiseserverstats) for per-node visibility.
+
+### `client.statsAll([subcommand])` → `Promise<ServerStats[]>`
+
+Fleet-wide variant of `stats()`: queries every server concurrently and returns one entry
+per node, in constructor order, as `{ host, port, stats, error }`. On success `stats` is
+the name/value map and `error` is `null`; when a node cannot be reached `stats` is `null`
+and `error` carries the reason. The promise never rejects because of a node failure, so a
+dashboard keeps seeing the healthy part of the fleet — check each entry's `error` field
+instead. Takes the same optional subcommand as `stats()`, with the same validation
+(`ValidationError` is thrown synchronously).
 
 ### `client.metrics()` → `ClientMetrics`
 

@@ -1,5 +1,5 @@
 export { Client } from './client.ts'
-export type { DeleteOptions, GetsResult, ServerAddress, StoreOptions } from './client.ts'
+export type { DeleteOptions, GetsResult, ServerAddress, ServerStats, StoreOptions } from './client.ts'
 export type {
   ClientMetrics,
   ClientOptions,
