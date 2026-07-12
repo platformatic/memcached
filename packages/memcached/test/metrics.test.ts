@@ -51,7 +51,7 @@ test('metrics() reports commands, pipeline, connection and bytes counters', asyn
   strictEqual(metrics.commands.byVerb.mg.failed, 0)
 
   // The shape is stable: every verb is always present
-  deepStrictEqual(Object.keys(metrics.commands.byVerb).sort(), ['auth', 'ma', 'md', 'mg', 'mn', 'ms', 'stats', 'version'])
+  deepStrictEqual(Object.keys(metrics.commands.byVerb).sort(), ['auth', 'config', 'ma', 'md', 'mg', 'mn', 'ms', 'stats', 'version'])
 
   strictEqual(metrics.pipeline.pendingDepth, 0)
   ok(metrics.pipeline.writes >= 3)

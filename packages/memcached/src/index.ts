@@ -1,6 +1,7 @@
 export { Client } from './client.ts'
-export type { DeleteOptions, GetsResult, ServerAddress, ServerStats, StoreOptions } from './client.ts'
+export type { ConfigEndpointAddress, DeleteOptions, GetsResult, ServerAddress, ServerStats, StoreOptions } from './client.ts'
 export type {
+  AutoDiscoveryOptions,
   CachedumpItem,
   ClientMetrics,
   ClientOptions,
