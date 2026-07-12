@@ -483,7 +483,8 @@ package does not.
 
 ## Roadmap
 
-- ElastiCache Auto Discovery (`config get cluster`) for dynamic node lists.
+- ElastiCache Auto Discovery (`config get cluster`) for dynamic node lists
+  ([#21](https://github.com/platformatic/memcached/issues/21)).
 
 ## License
 
