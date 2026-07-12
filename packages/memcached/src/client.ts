@@ -58,6 +58,19 @@ export interface GetsResult {
   cas: string
 }
 
+export interface ServerStats {
+  host: string
+  port: number
+  /**
+   * The server's statistics, or `null` when the query failed.
+   */
+  stats: Record<string, string> | null
+  /**
+   * The failure reason, or `null` when the query succeeded.
+   */
+  error: Error | null
+}
+
 interface ParsedAddress {
   host: string
   port: number
@@ -166,6 +179,20 @@ function validateTTL (ttl: number | undefined): number {
   }
 
   return ttl
+}
+
+function statsCommand (subcommand: string | undefined): string {
+  if (subcommand === undefined) {
+    return `stats${CRLF}`
+  }
+
+  if (typeof subcommand !== 'string' || !STATS_SUBCOMMAND_EXPRESSION.test(subcommand)) {
+    throw new ValidationError(
+      'The stats subcommand must be a non-empty string of at most 250 printable ASCII characters and cannot contain whitespace or control characters'
+    )
+  }
+
+  return `stats ${subcommand}${CRLF}`
 }
 
 function validateCas (cas: string | number | bigint): string {
@@ -387,20 +414,40 @@ export class Client {
    * An optional subcommand selects a specific domain, e.g. `'items'`,
    * `'slabs'` or `'settings'`. Only `END`-terminated subcommands are
    * supported. With multiple servers, the first server's stats are returned;
-   * per-node visibility needs a client per node.
+   * use statsAll() for per-node visibility.
    */
   stats (subcommand?: string): Promise<Record<string, string>> {
-    if (subcommand === undefined) {
-      return this.#connections[0].execute(TYPE_STATS, `stats${CRLF}`)
-    }
+    return this.#connections[0].execute(TYPE_STATS, statsCommand(subcommand))
+  }
 
-    if (typeof subcommand !== 'string' || !STATS_SUBCOMMAND_EXPRESSION.test(subcommand)) {
-      throw new ValidationError(
-        'The stats subcommand must be a non-empty string of at most 250 printable ASCII characters and cannot contain whitespace or control characters'
+  /**
+   * Returns statistics for every server, one entry per node in constructor
+   * order. Nodes are queried concurrently and failures are reported per
+   * entry: `stats` is the name/value map and `error` is `null` on success,
+   * while on failure `stats` is `null` and `error` carries the reason. The
+   * promise never rejects because of an unreachable node, so a dashboard
+   * still sees the healthy part of the fleet. Takes the same optional
+   * subcommand as stats() and throws `ValidationError` synchronously when it
+   * is invalid.
+   */
+  statsAll (subcommand?: string): Promise<ServerStats[]> {
+    const payload = statsCommand(subcommand)
+    const nodes = this.#connections.length / this.#poolSize
+    const queries: Array<Promise<ServerStats>> = []
+
+    // Stats are per server, not per connection: query each node's first pool member
+    for (let i = 0; i < nodes; i++) {
+      const connection = this.#connections[i * this.#poolSize]
+
+      queries.push(
+        connection.execute<Record<string, string>>(TYPE_STATS, payload).then(
+          stats => ({ host: connection.host, port: connection.port, stats, error: null }),
+          error => ({ host: connection.host, port: connection.port, stats: null, error })
+        )
       )
     }
 
-    return this.#connections[0].execute(TYPE_STATS, `stats ${subcommand}${CRLF}`)
+    return Promise.all(queries)
   }
 
   /**

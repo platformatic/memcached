@@ -325,6 +325,14 @@ export class Connection extends EventEmitter {
     this.#connect()
   }
 
+  get host (): string {
+    return this.#host
+  }
+
+  get port (): number {
+    return this.#port
+  }
+
   get socket (): Socket | null {
     return this.#socket
   }
