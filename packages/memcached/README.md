@@ -324,6 +324,27 @@ than 30 days are interpreted as absolute Unix timestamps.
   `node benchmarks/autopipelining.js` to compare the flush scheduling modes below under
   concurrent independent issuers.
 
+### Comparison with other clients
+
+`node benchmarks/compare-all.js` measures SET/GET throughput against the notable Node.js
+memcached clients. Each library runs with its best-known configuration rather than its
+defaults: this client and [memjs](https://github.com/memcachier/memjs) pipeline on a single
+connection, while [memcached](https://github.com/3rd-Eden/memcached) (3rd-Eden) and
+[memcache-client](https://github.com/electrode-io/memcache) do not pipeline the same way and
+get a 10-connection pool (the 3rd-Eden client is additionally throttled to 20 in-flight
+operations — its pool wedges beyond that, and it is faster this way too).
+
+Median of 3 runs — 50,000 operations at concurrency 500 against `memcached:alpine` in
+Docker on loopback, Node.js 24, Linux. Absolute numbers vary by machine; run the benchmark
+yourself for yours.
+
+| ops/s | @platformatic/memcached | memjs | memcache-client (pool 10) | memcached (pool 10) |
+| --- | ---: | ---: | ---: | ---: |
+| SET 64 B | **352,000** | 111,000 | 138,000 | 43,000 |
+| GET 64 B | **369,000** | 137,000 | 113,000 | 59,000 |
+| SET 4 KiB | **168,000** | 80,000 | 92,000 | 31,000 |
+| GET 4 KiB | **135,000** | 92,000 | 87,000 | 10,000 |
+
 ### Auto-pipelining modes
 
 Outgoing commands are corked and flushed as a single `writev`. The `autoPipelining` option
