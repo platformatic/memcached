@@ -18,6 +18,27 @@ This repository is a [pnpm](https://pnpm.io/) workspace.
 
 See each package's README for full documentation.
 
+## Performance
+
+SET/GET throughput against the notable Node.js memcached clients, each running with its
+best-known configuration — this client and [memjs](https://github.com/memcachier/memjs)
+pipeline on a single connection, while
+[memcache-client](https://github.com/electrode-io/memcache) and
+[memcached](https://github.com/3rd-Eden/memcached) (3rd-Eden) get a 10-connection pool.
+Median of 3 runs, 50,000 operations at concurrency 500, `memcached:alpine` on loopback,
+Node.js 24, Linux:
+
+| ops/s | @platformatic/memcached | memjs | memcache-client (pool 10) | memcached (pool 10) |
+| --- | ---: | ---: | ---: | ---: |
+| SET 64 B | **352,000** | 111,000 | 138,000 | 43,000 |
+| GET 64 B | **369,000** | 137,000 | 113,000 | 59,000 |
+| SET 4 KiB | **168,000** | 80,000 | 92,000 | 31,000 |
+| GET 4 KiB | **135,000** | 92,000 | 87,000 | 10,000 |
+
+Absolute numbers vary by machine: reproduce with
+`node packages/memcached/benchmarks/compare-all.js` (details in the
+[client's performance notes](./packages/memcached#performance-notes)).
+
 ## Development
 
 ```bash
