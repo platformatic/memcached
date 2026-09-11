@@ -44,5 +44,7 @@ jobs:
       - name: Publish to NPM
         run: pnpm -r publish --access public --tag ${{ inputs.prerelease == true && 'next' || 'latest' }} --provenance --publish-branch ${{ github.ref_name }} --no-git-checks
       - name: 'Create release notes'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
         run: |
-          pnpx @matteo.collina/release-notes -a ${{ secrets.GH_RELEASE_TOKEN }} -t v${{ steps.bump.outputs.version }} -r memcached -o platformatic ${{ inputs.prerelease == true && '-p' || '' }} -c ${{ github.ref }}
+          pnpx @matteo.collina/release-notes -t v${{ steps.bump.outputs.version }} -r memcached -o platformatic ${{ inputs.prerelease == true && '-p' || '' }} -c ${{ github.ref }}
