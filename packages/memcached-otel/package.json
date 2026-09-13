@@ -36,7 +36,7 @@
   },
   "author": "Platformatic Inc. <oss@platformatic.dev> (https://platformatic.dev)",
   "dependencies": {
-    "@opentelemetry/instrumentation": "^0.220.0"
+    "@opentelemetry/instrumentation": "^0.222.0"
   },
   "peerDependencies": {
     "@opentelemetry/api": "^1.9.0",
