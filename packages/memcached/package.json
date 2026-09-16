@@ -1,6 +1,6 @@
 {
   "name": "@platformatic/memcached",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Minimal, high-performance memcached client for Node.js based on the meta text protocol",
   "license": "Apache-2.0",
   "type": "module",
