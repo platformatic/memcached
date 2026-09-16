@@ -3,10 +3,6 @@
 A minimal, high-performance [memcached](https://memcached.org/) client for Node.js, built on the
 [meta text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt).
 
-> **Status**: this package is currently **private and experimental**. It backs the memcached
-> storage adapter for Platformatic gateway request deduplication. APIs may change before a
-> public release.
-
 ## Why the meta protocol?
 
 memcached ships three protocols. The classic text protocol is verbose and has ambiguous

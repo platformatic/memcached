@@ -3,20 +3,44 @@
 A minimal, high-performance [memcached](https://memcached.org/) client for Node.js, built on the
 [meta text protocol](https://github.com/memcached/memcached/blob/master/doc/protocol.txt).
 
-> **Status**: this package is currently **private and experimental**. It backs the memcached
-> storage adapter for Platformatic gateway request deduplication. APIs may change before a
-> public release.
-
 This repository is a [pnpm](https://pnpm.io/) workspace.
 
 ## Packages
 
-| Package | Description |
-| --- | --- |
-| [`@platformatic/memcached`](./packages/memcached) | The memcached client: meta protocol, full request pipelining, zero runtime dependencies. |
-| [`@platformatic/memcached-otel`](./packages/memcached-otel) | OpenTelemetry tracing instrumentation for the client, built on its diagnostics channels. |
+| Package | Documentation | Description |
+| --- | --- | --- |
+| [`@platformatic/memcached`](https://www.npmjs.com/package/@platformatic/memcached) | [Client README](./packages/memcached/README.md) | The memcached client: meta protocol, full request pipelining, zero runtime dependencies. |
+| [`@platformatic/memcached-otel`](https://www.npmjs.com/package/@platformatic/memcached-otel) | [OpenTelemetry README](./packages/memcached-otel/README.md) | OpenTelemetry tracing instrumentation for the client, built on its diagnostics channels. |
 
-See each package's README for full documentation.
+## Quick start
+
+```bash
+npm install @platformatic/memcached
+```
+
+```js
+import { Client } from '@platformatic/memcached'
+
+const client = new Client('localhost:11211')
+
+await client.set('greeting', 'hello', { ttl: 60 })
+const value = await client.get('greeting')
+
+console.log(value?.toString()) // 'hello'
+
+await client.close()
+```
+
+For complete usage and API details, see the client documentation:
+
+- [Installation](./packages/memcached/README.md#installation) and
+  [quick start](./packages/memcached/README.md#quick-start)
+- [Client API](./packages/memcached/README.md#api)
+- [Authentication](./packages/memcached/README.md#authentication),
+  [sharding](./packages/memcached/README.md#multiple-servers-client-side-sharding), and
+  [ElastiCache Auto Discovery](./packages/memcached/README.md#elasticache-auto-discovery)
+- [Metrics and diagnostics](./packages/memcached/README.md#metrics-and-diagnostics)
+- [OpenTelemetry instrumentation](./packages/memcached-otel/README.md#usage)
 
 ## Performance
 
