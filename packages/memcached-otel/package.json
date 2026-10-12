@@ -47,7 +47,7 @@
     "@opentelemetry/sdk-trace-base": "^2.9.0",
     "@platformatic/memcached": "workspace:^",
     "@types/node": "^24.0.0",
-    "typescript": "^6.0.3"
+    "typescript": "^7.0.0"
   },
   "keywords": [
     "memcached",
